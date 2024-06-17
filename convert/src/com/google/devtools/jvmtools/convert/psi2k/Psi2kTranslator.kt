@@ -1766,7 +1766,7 @@ private open class Psi2kTranslator(
             if (
               needBlockClose && blockElem is PsiBreakStatement && blockElem.labelIdentifier == null
             ) {
-              blockElem.replaceWith("}\n")
+              blockElem.replaceWith("}")
               needBlockClose = false
             } else {
               if (needBlockClose && blockElem.tokenOrNull() == "}") {
