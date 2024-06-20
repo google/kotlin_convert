@@ -1977,7 +1977,7 @@ private open class Psi2kTranslator(
           // carry type annotations, but the parent's type's component type does.
           ((node.parent as? PsiTypeElement)?.type as? PsiArrayType)?.deepComponentType
         ) ||
-        inferredNullable(node.parent as? PsiLocalVariable)
+        inferredNullable(node.parent as? PsiVariable)
     ) {
       data.append("?")
     } else if (
@@ -1993,16 +1993,27 @@ private open class Psi2kTranslator(
     }
   }
 
-  private fun inferredNullable(variable: PsiLocalVariable?): Boolean {
-    val root = variable?.getParentOfTypes2<PsiMethod, PsiLambdaExpression>() ?: return false
+  private fun inferredNullable(variable: PsiVariable?): Boolean {
+    if (variable !is PsiLocalVariable && variable !is PsiParameter) return false
 
+    val root = variable.getParentOfTypes2<PsiMethod, PsiLambdaExpression>() ?: return false
     val nullness =
       when (val rootNode = root.toUElement()) {
         is UMethod -> rootNode.nullness()
         is ULambdaExpression -> rootNode.nullness()
         else -> return false
       }
+
     val noNullableBoundDeclared by lazy { !variable.type.hasNullableBound() }
+
+    if (variable is PsiParameter) {
+      // For parameters, use stored value at declaration site. If the parameter is re-assigned,
+      // we need a local variable anyway (b/347273856) and can make that nullable.
+      val value = nullness[variable].store[variable] ?: Nullness.BOTTOM
+      return Nullness.NULL.implies(value) ||
+        (value == Nullness.PARAMETRIC && noNullableBoundDeclared)
+    }
+
     fun PsiExpression.requiresNullable(): Boolean {
       val value = nullness[this].value
       return Nullness.NULL.implies(value) ||
