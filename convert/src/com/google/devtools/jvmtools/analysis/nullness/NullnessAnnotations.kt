@@ -134,13 +134,13 @@ fun PsiElement.isInNullMarkedScope(): Boolean {
   while (parent != null && parent !is PsiFile) {
     if (parent is PsiModifierListOwner) {
       if (
-        parent.hasAnnotation("org.jspecify.annotations.NullMarked") ||
+        parent.hasAnnotation("org.jspecify.nullness.NullMarked") ||
           parent.hasAnnotation("org.jspecify.annotations.NullMarked")
       ) {
         return true
       }
       if (
-        parent.hasAnnotation("org.jspecify.annotations.NullUnmarked") ||
+        parent.hasAnnotation("org.jspecify.nullness.NullUnmarked") ||
           parent.hasAnnotation("org.jspecify.annotations.NullUnmarked")
       ) {
         return false
