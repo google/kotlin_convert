@@ -169,69 +169,96 @@ private class TypeArgumentVisitor(
       return if (annotated == Nullness.PARAMETRIC) parametricNullness(emptyList()) else annotated
     }
 
-    return when (this) {
-      is PsiArrayType ->
-        componentType.componentNullness(selector, decl, fromIndex + 1, parametricNullness)
-      is PsiClassType -> {
-        val generics: PsiClassType.ClassResolveResult = resolveGenerics()
-        val clazz = generics.element ?: return null
-        if (clazz is PsiTypeParameter) return parametricNullness(selector.subList(fromIndex))
+    // PsiTypeVisitor automatically "sees through" lambda/method reference types (b/349161001).
+    // It's a bit inefficient to create a new one on each recursion, but allows the logic above to
+    // run on all types and without creating a visitor.
+    return accept(
+      object : PsiTypeVisitor<Nullness?>() {
+        override fun visitType(type: PsiType): Nullness? {
+          TODO("Don't know how to traverse $this for $selector [$fromIndex]")
+        }
 
-        val selectedParam = selector[fromIndex] ?: return null // expected array type
-        val paramClass =
-          requireNotNull(selectedParam.owner as? PsiClass) {
-            "Selectors must be class type parameters: $selectedParam"
-          }
-        // This can happen when visiting wildcard bounds, in particular, Object
-        if (!InheritanceUtil.isInheritorOrSelf(clazz, paramClass, /* checkDeep= */ true)) {
-          return null
-        }
-        // Extract the selected type argument relative to the parameter's declaring class (see
-        // getSuperClassSubstitutor's javadoc).
-        val substitutor = getSuperClassSubstitutor(paramClass, clazz, generics.substitutor)
-        val selectedType = substitutor.substitute(selectedParam)
-        selectedType?.componentNullness(selector, decl, fromIndex + 1, parametricNullness)
-      }
-      is PsiWildcardType -> {
-        val wildcardedParam = selector[fromIndex - 1]
-        val implicitBounds =
-          wildcardedParam?.extendsList?.referencedTypes ?: PsiClassType.EMPTY_ARRAY
-        // If there are implicit bounds, collect their constraints, otherwise ignore since the
-        // implicit bound is Object on which we can't match a non-empty selector anyway.
-        val implicitUpper =
-          runIf(implicitBounds.isNotEmpty()) {
-            implicitBounds
-              .mapNotNull { it.componentNullness(selector, decl, fromIndex, parametricNullness) }
-              .reduceOrNull(Nullness::equate)
-          }
-        when {
-          isSuper -> {
-            val lowerBound =
-              superBound.componentNullness(selector, decl, fromIndex, parametricNullness)
-            implicitUpper join lowerBound
-          }
-          isExtends -> {
-            val upperBound =
-              extendsBound.componentNullness(selector, decl, fromIndex, parametricNullness)
-            when {
-              upperBound == null -> implicitUpper
-              implicitUpper == null -> upperBound
-              else -> implicitUpper.equate(upperBound)
+        override fun visitArrayType(arrayType: PsiArrayType): Nullness? =
+          arrayType.componentType.componentNullness(
+            selector,
+            decl,
+            fromIndex + 1,
+            parametricNullness,
+          )
+
+        override fun visitClassType(classType: PsiClassType): Nullness? {
+          val generics: PsiClassType.ClassResolveResult = classType.resolveGenerics()
+          val clazz = generics.element ?: return null
+          if (clazz is PsiTypeParameter) return parametricNullness(selector.subList(fromIndex))
+
+          val selectedParam = selector[fromIndex] ?: return null // expected array type
+          val paramClass =
+            requireNotNull(selectedParam.owner as? PsiClass) {
+              "Selectors must be class type parameters: $selectedParam"
             }
+          // This can happen when visiting wildcard bounds, in particular, Object
+          if (!InheritanceUtil.isInheritorOrSelf(clazz, paramClass, /* checkDeep= */ true)) {
+            return null
           }
-          else -> implicitUpper
+          // Extract the selected type argument relative to the parameter's declaring class (see
+          // getSuperClassSubstitutor's javadoc).
+          val substitutor = getSuperClassSubstitutor(paramClass, clazz, generics.substitutor)
+          val selectedType = substitutor.substitute(selectedParam)
+          return selectedType?.componentNullness(selector, decl, fromIndex + 1, parametricNullness)
         }
+
+        override fun visitWildcardType(wildcardType: PsiWildcardType): Nullness? {
+          val wildcardedParam = selector[fromIndex - 1]
+          val implicitBounds =
+            wildcardedParam?.extendsList?.referencedTypes ?: PsiClassType.EMPTY_ARRAY
+          // If there are implicit bounds, collect their constraints, otherwise ignore since the
+          // implicit bound is Object on which we can't match a non-empty selector anyway.
+          val implicitUpper =
+            runIf(implicitBounds.isNotEmpty()) {
+              implicitBounds
+                .mapNotNull { it.componentNullness(selector, decl, fromIndex, parametricNullness) }
+                .reduceOrNull(Nullness::equate)
+            }
+          return when {
+            wildcardType.isSuper -> {
+              val lowerBound =
+                wildcardType.superBound.componentNullness(
+                  selector,
+                  decl,
+                  fromIndex,
+                  parametricNullness,
+                )
+              implicitUpper join lowerBound
+            }
+            wildcardType.isExtends -> {
+              val upperBound =
+                wildcardType.extendsBound.componentNullness(
+                  selector,
+                  decl,
+                  fromIndex,
+                  parametricNullness,
+                )
+              when {
+                upperBound == null -> implicitUpper
+                implicitUpper == null -> upperBound
+                else -> implicitUpper.equate(upperBound)
+              }
+            }
+            else -> implicitUpper
+          }
+        }
+
+        override fun visitIntersectionType(intersectionType: PsiIntersectionType): Nullness? =
+          intersectionType.superTypes
+            .mapNotNull { it.componentNullness(selector, decl, fromIndex, parametricNullness) }
+            .reduceOrNull(Nullness::equate)
+
+        override fun visitDisjunctionType(disjunctionType: PsiDisjunctionType): Nullness? =
+          disjunctionType.disjunctions
+            .mapNotNull { it.componentNullness(selector, decl, fromIndex, parametricNullness) }
+            .reduceOrNull(Nullness::join)
       }
-      is PsiIntersectionType ->
-        superTypes
-          .mapNotNull { it.componentNullness(selector, decl, fromIndex, parametricNullness) }
-          .reduceOrNull(Nullness::equate)
-      is PsiDisjunctionType ->
-        disjunctions
-          .mapNotNull { it.componentNullness(selector, decl, fromIndex, parametricNullness) }
-          .reduceOrNull(Nullness::join)
-      else -> TODO("Don't know how to traverse $this for $selector [$fromIndex]")
-    }
+    )
   }
 
   private fun inferFromArguments(
