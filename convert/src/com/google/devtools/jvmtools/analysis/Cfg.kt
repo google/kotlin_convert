@@ -19,7 +19,6 @@ package com.google.devtools.jvmtools.analysis
 import com.google.common.collect.HashBasedTable
 import com.google.common.collect.HashMultimap
 import com.google.common.collect.ImmutableMultimap
-import com.google.common.collect.ImmutableTable
 import com.google.errorprone.annotations.CanIgnoreReturnValue
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiType
@@ -76,10 +75,12 @@ data class Cfg
 private constructor(
   /** The unique first ("entry") node in the [Cfg]. */
   val entryNode: UElement,
+  private val exitNode: UElement,
   private val forwardEdges: ImmutableMultimap<UElement, UElement>,
-  private val edgeConditions: ImmutableTable<UElement, UElement, CfgEdgeLabel>,
+  private val edgeConditions: (UElement, UElement) -> CfgEdgeLabel?,
   /** Allows finding [PsiElement]s in a [Cfg]. */
   val sourceMapping: ImmutableMultimap<PsiElement, UElement>,
+  private val reversed: Boolean = false,
 ) {
   /** Returns the set of nodes that follow the given [node] in this [Cfg]. */
   fun successors(node: UElement): Collection<UElement> = forwardEdges[node]
@@ -94,7 +95,19 @@ private constructor(
   // Internal for now b/c the CfgEdgeLabel API feels a bit wonky
   // TODO(kmb): Consider using `Set<Union<Boolean?, PsiType>>` as edge labels
   internal fun successorsWithConditions(node: UElement): Map<UElement, CfgEdgeLabel?> =
-    forwardEdges[node].associateWith { edgeConditions[node, it] }
+    forwardEdges[node].associateWith { edgeConditions(node, it) }
+
+  fun reverse(): Cfg {
+    require(!reversed) { "Don't reverse a reversed CFG, just use the original." }
+    return Cfg(
+      entryNode = exitNode,
+      exitNode = entryNode,
+      forwardEdges.inverse(),
+      edgeConditions = { source: UElement, dest: UElement -> edgeConditions(dest, source) },
+      sourceMapping,
+      reversed = true,
+    )
+  }
 
   companion object {
     /** Derives a [Cfg] for the given method. */
@@ -109,8 +122,9 @@ private constructor(
         // TODO(kmb): consider eagerly dropping unreachable edges
         Cfg(
           checkNotNull(entryNode) { "No entry node found in $root" },
+          exitNode = root,
           ImmutableMultimap.copyOf(forwardEdges),
-          ImmutableTable.copyOf(edgeConditions),
+          edgeConditions::get,
           sourceMapping.build(),
         )
       }

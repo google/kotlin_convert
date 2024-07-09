@@ -28,7 +28,7 @@ import com.google.devtools.jvmtools.analysis.TransferInput
 import com.google.devtools.jvmtools.analysis.TransferResult
 import com.google.devtools.jvmtools.analysis.UAnalysis
 import com.google.devtools.jvmtools.analysis.UDataflowContext
-import com.google.devtools.jvmtools.analysis.UForwardTransfer
+import com.google.devtools.jvmtools.analysis.UTransferFunction
 import com.google.devtools.jvmtools.analysis.analyze
 import com.google.devtools.jvmtools.analysis.passthroughResult
 import com.intellij.lang.java.JavaLanguage
@@ -195,7 +195,7 @@ private class NullnessTransfer(
   private val analysis: UDataflowContext<State<Nullness>>,
   override val initialState: State<Nullness>,
   root: UElement,
-) : UForwardTransfer<State<Nullness>> {
+) : UTransferFunction<State<Nullness>> {
   override val bottom = State(Nullness.BOTTOM, Store())
 
   private val javaLangIterable: PsiClass by lazy {

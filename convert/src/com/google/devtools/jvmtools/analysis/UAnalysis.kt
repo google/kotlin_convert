@@ -33,7 +33,7 @@ interface UAnalysis<T> : PsiAnalysis<T> {
 }
 
 /**
- * Abstract values tracked by a [dataflow][UForwardTransfer] analysis.
+ * Abstract values tracked by a [dataflow][UTransferFunction] analysis.
  *
  * Concrete implementations should implement a lattice of finite height, to guarantee termination of
  * iterative dataflow analyses.

@@ -25,44 +25,59 @@ import org.jetbrains.uast.UElement
 import org.jetbrains.uast.UExpression
 import org.jetbrains.uast.UMethod
 
-/** Context for [UForwardTransfer] implementations to query analysis results. */
+/** Context for [UTransferFunction] implementations to query analysis results. */
 // Identical to UAnalysis, but can add additional query functions here
 interface UDataflowContext<T : Value<T>> : UAnalysis<T>
 
 /**
- * Shorthand for functions that construct [UForwardTransfer]s for given root node (e.g., a method)
+ * Shorthand for functions that construct [UTransferFunction]s for given root node (e.g., a method)
  * that can query the given context.
  */
-typealias ForwardTransferFactory<T> = (UDataflowContext<T>) -> UForwardTransfer<T>
+typealias TransferFactory<T> = (UDataflowContext<T>) -> UTransferFunction<T>
 
 /**
- * Analyzes this method with the [UForwardTransfer] returned by [transferFactory].
+ * Analyzes this method with the [UTransferFunction] returned by [transferFactory].
  *
- * @param transferFactory returns [UForwardTransfer] for this method, which (awkwardly) allows the
+ * @param transferFactory returns [UTransferFunction] for this method, which (awkwardly) allows the
  *   transfer function to receive a reference back to the running analysis to query results.
  */
-fun <T : Value<T>> UMethod.analyze(transferFactory: ForwardTransferFactory<T>): UAnalysis<T> =
+fun <T : Value<T>> UMethod.analyze(transferFactory: TransferFactory<T>): UAnalysis<T> =
   DataflowAnalysis(Cfg.create(this), transferFactory).also { it.runAnalysis() }
 
 /**
- * Analyzes this [CfgRoot] with the [UForwardTransfer] returned by [transferFactory].
+ * Analyzes this [CfgRoot] with the [UTransferFunction] returned by [transferFactory].
  *
- * @param transferFactory returns [UForwardTransfer] for this root, which (awkwardly) allows the
+ * @param transferFactory returns [UTransferFunction] for this root, which (awkwardly) allows the
  *   transfer function to receive a reference back to the running analysis to query results.
  */
-fun <T : Value<T>> CfgRoot.analyze(transferFactory: ForwardTransferFactory<T>): UAnalysis<T> =
+fun <T : Value<T>> CfgRoot.analyze(transferFactory: TransferFactory<T>): UAnalysis<T> =
   DataflowAnalysis(Cfg.create(this), transferFactory).also { it.runAnalysis() }
 
 /**
  * Base class for dataflow transfer functions. Subclasses should override [CfgTypedVisitor] methods
- * for nodes they care about and derive [TransferInput]s from the given input state as needed.
+ * for nodes they care about and derive [TransferResult]s from the given input state as needed.
  *
  * Use [toNormalResult] or [passthroughResult] to turn an input into [TransferResult] "unseen",
  * which the default implementations in this interface do for all nodes.
  *
  * @param T abstract values being tracked
  */
-interface UForwardTransfer<T : Value<T>> : CfgTypedVisitor<TransferInput<T>, TransferResult<T>> {
+interface UTransferFunction<T : Value<T>> : CfgTypedVisitor<TransferInput<T>, TransferResult<T>> {
+  /**
+   * Whether this is a backwards transfer function, meaning the [TransferResult]s it returns are
+   * immediately _prior to_ execution of the given node, given [TransferInput]s representing state
+   * immediately following the node's execution (including from exceptional successors).
+   *
+   * Backwards transfer functions should nearly never return anything but [passthroughResult]s or
+   * [TransferResult.normal] results with no exceptional values. [TransferInput.value] will however
+   * allow querying input values separately by condition when visiting control flow branches.
+   *
+   * Returns `false` by default and should be overridden to return `true` to define backwards
+   * transfer functions.
+   */
+  val isBackwards: Boolean
+    get() = false
+
   /**
    * The concrete [T]'s most precise ("bottom") value, which will be used when no other information
    * is available (e.g., in [UAnalysis.get]).
@@ -83,7 +98,7 @@ interface UForwardTransfer<T : Value<T>> : CfgTypedVisitor<TransferInput<T>, Tra
 }
 
 /**
- * Result of [transferring][UForwardTransfer] over a node, which can be constructed as a [normal]
+ * Result of [transferring][UTransferFunction] over a node, which can be constructed as a [normal]
  * result, or [conditional] upon the node's Boolean value.
  *
  * This class is "write-only" for transfer functions: it defines `internal` functions to be used in
@@ -97,22 +112,25 @@ sealed class TransferResult<T : Value<T>>(
   @Suppress("Immutable") // PsiType can't be annotated
   private val exceptionalValues: Map<PsiType, T>
 ) {
-  /** Returns the represented value *assuming non-exceptional return*. */
-  internal abstract fun regularReturnValue(): T
+  /**
+   * Returns the default result to be propagated except along labeled edges with matching
+   * [Conditional] or [exceptionalValues].
+   */
+  internal abstract fun defaultResultValue(): T
 
   /**
    * Transforms this result to an input, optionally filtered by the given edge label.
    *
    * @param label [Cfg] edge label to filter by, `null` meaning *regular return*, i.e., as defined
    *   by [Cfg.successorsWithConditions]
-   * @param default value to use for other conditions, typically, [UForwardTransfer.bottom]
+   * @param default value to use for other conditions, typically, [UTransferFunction.bottom]
    */
   internal abstract fun toInput(label: CfgEdgeLabel?, default: T): TransferInput<T>
 
   /**
    * Returns a value for the given exception type.
    *
-   * @return value for the mapping with most precise type or [regularReturnValue] if no such type
+   * @return value for the mapping with most precise type or [defaultResultValue] if no such type
    */
   private fun exceptionalValue(thrownType: PsiType): T {
     var result: T? = null
@@ -126,7 +144,7 @@ sealed class TransferResult<T : Value<T>>(
         found = exception
       }
     }
-    return result ?: regularReturnValue() // use regular return if no matching exception
+    return result ?: defaultResultValue() // use regular return if no matching exception
   }
 
   internal fun toExceptionalInput(
@@ -135,14 +153,14 @@ sealed class TransferResult<T : Value<T>>(
   ): TransferInput<T> =
     TransferInput.Normal(
       exceptionalLabel.thrown
-        .map { if (it != null) exceptionalValue(it) else regularReturnValue() }
+        .map { if (it != null) exceptionalValue(it) else defaultResultValue() }
         .reduceOrNull(Value<T>::join) ?: default
     )
 
   @VisibleForTesting
   internal class Normal<T : Value<T>>(val value: T, exceptionalValues: Map<PsiType, T>) :
     TransferResult<T>(exceptionalValues) {
-    override fun regularReturnValue(): T = value
+    override fun defaultResultValue(): T = value
 
     override fun toInput(label: CfgEdgeLabel?, default: T): TransferInput<T> =
       when (label) {
@@ -159,7 +177,7 @@ sealed class TransferResult<T : Value<T>>(
     val falseValue: T,
     exceptionalValues: Map<PsiType, T>,
   ) : TransferResult<T>(exceptionalValues) {
-    override fun regularReturnValue(): T = trueValue join falseValue
+    override fun defaultResultValue(): T = trueValue join falseValue
 
     override fun toInput(label: CfgEdgeLabel?, default: T): TransferInput<T> =
       when (label) {
@@ -192,7 +210,7 @@ sealed class TransferResult<T : Value<T>>(
 }
 
 /**
- * Input to [transfer functions][UForwardTransfer] that exposes incoming analysis [value]s.
+ * Input to [transfer functions][UTransferFunction] that exposes incoming analysis [value]s.
  *
  * @param T abstract values being tracked
  * @see TransferInput
@@ -284,16 +302,16 @@ fun <T : Value<T>> TransferInput<T>.passthroughResult(node: UExpression): Transf
  *
  * @param T abstract values being tracked
  */
-private class DataflowAnalysis<T : Value<T>>(
-  private val cfg: Cfg,
-  transferFactory: ForwardTransferFactory<T>,
-) : UDataflowContext<T> {
+private class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: TransferFactory<T>) :
+  UDataflowContext<T> {
   private val before = mutableMapOf<UElement, TransferInput<T>>()
   private val after = mutableMapOf<UElement, TransferResult<T>>()
 
-  // `transfer` should be the last property to be initialized so transferFactory can't see
-  // uninitialized properties (besides `transfer` itself).
-  private val transfer: UForwardTransfer<T> = transferFactory(this)
+  // transferFactory should store this reference for later use or ignore it; calling methods on it
+  // will likely fail as it usually requires `cfg`, which in turn requires `transfer.isBackwards`.
+  // A better solution would be nice, but in practice this usually works.
+  private val transfer: UTransferFunction<T> = transferFactory(this)
+  private val cfg: Cfg = if (transfer.isBackwards) cfg.reverse() else cfg
 
   fun runAnalysis() {
     val pending = mutableSetOf<UElement>()
@@ -307,7 +325,7 @@ private class DataflowAnalysis<T : Value<T>>(
     }
   }
 
-  fun transferOver(node: UElement): List<UElement> {
+  private fun transferOver(node: UElement): List<UElement> {
     val before = checkNotNull(before[node]) { "don't have any state for $node" }
     val after = node.accept(transfer, before)
     return updateAfter(node, after)
@@ -334,12 +352,12 @@ private class DataflowAnalysis<T : Value<T>>(
   }
 
   override fun get(node: UElement): T {
-    return after[node]?.regularReturnValue() ?: transfer.bottom
+    return after[node]?.defaultResultValue() ?: transfer.bottom
   }
 
   override fun get(element: PsiElement): T {
     val nodes = cfg.sourceMapping[element]
-    return nodes.mapNotNull { after[it]?.regularReturnValue() }.reduceOrNull(Value<T>::join)
+    return nodes.mapNotNull { after[it]?.defaultResultValue() }.reduceOrNull(Value<T>::join)
       ?: transfer.bottom
   }
 
