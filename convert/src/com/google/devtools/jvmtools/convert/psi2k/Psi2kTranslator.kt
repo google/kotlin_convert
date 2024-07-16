@@ -115,8 +115,6 @@ import com.intellij.psi.PsiUnaryExpression
 import com.intellij.psi.PsiVariable
 import com.intellij.psi.PsiWhiteSpace
 import com.intellij.psi.PsiWildcardType
-import com.intellij.psi.javadoc.PsiDocComment
-import com.intellij.psi.util.MethodSignatureUtil.areSignaturesEqual
 import com.intellij.psi.util.TypeConversionUtil.calcTypeForBinaryExpression
 import com.intellij.psi.util.TypeConversionUtil.isIntegralNumberType
 import com.intellij.psi.util.TypeConversionUtil.isNumericType
@@ -624,42 +622,7 @@ private open class Psi2kTranslator(
 
     if (node.isAnnotationType) data.append(") {\n")
 
-    if (!node.isInterface && !node.isEnum) {
-      val inheritedMethods =
-        (node.superClass?.allMethods ?: PsiMethod.EMPTY_ARRAY)
-          .filter { !it.isStatic && !it.isConstructor && !it.isAbstract }
-          .filter { superMethod -> node.methods.none { it.isOverrideEquivalentTo(superMethod) } }
-      val interfaceMethods =
-        node.interfaces
-          .flatMap { itf ->
-            itf.allMethods
-              .filter { it.isAbstract || it.hasModifierProperty(PsiModifier.DEFAULT) }
-              .toSet()
-          }
-          .toSet()
-
-      with(Psi2kTranslator(data, seen = mutableMapOf())) {
-        // See if there are any methods we inherit both from superclass and interface, and insert
-        // a stub that delegates to the superclass, which preserves Java's semantics but must be
-        // made explicit in Kotlin (if the interface is defined in Kotlin). Note this can lead to
-        // compilation errors if the superclass method is final.
-        for (toOverride in
-          interfaceMethods.filter { itfMethod ->
-            inheritedMethods.any { superMethod -> itfMethod.isOverrideEquivalentTo(superMethod) }
-          }) {
-          visitMethod(toOverride, isStubCopy = true)
-          data.append(" = super.")
-          data.append(seen.getOrNull(toOverride.nameIdentifier) ?: quoteIfNeeded(toOverride.name))
-          data.append("(")
-          data.append(
-            toOverride.parameterList.parameters.joinToString(separator = ", ") {
-              seen.getOrNull(it.nameIdentifier) ?: quoteIfNeeded(it.name)
-            }
-          )
-          data.append(")\n")
-        }
-      }
-    }
+    // TODO(b/353274410): disambiguate methods inherited from superclass and interfaces
 
     if (companionOut.isNotEmpty()) {
       data.append("companion object {\n")
@@ -1019,11 +982,6 @@ private open class Psi2kTranslator(
   }
 
   override fun visitMethod(node: PsiMethod) {
-    visitMethod(node, isStubCopy = false)
-  }
-
-  /** Visits the given [node], optionally only the declaration if [isStubCopy] is `true`. */
-  private fun visitMethod(node: PsiMethod, isStubCopy: Boolean) {
     seen(node)
 
     // Omit generated enum methods values(), valueOf("...")
@@ -1043,11 +1001,7 @@ private open class Psi2kTranslator(
         node.typeParameterList ?: node.nameIdentifier ?: node.parameterList
       node
         .children()
-        .filter {
-          it != node.throwsList &&
-            it != node.returnTypeElement &&
-            (!isStubCopy || (it != node.body && it.tokenOrNull() != ";" && it !is PsiDocComment))
-        }
+        .filter { it != node.throwsList && it != node.returnTypeElement }
         .forEach { child ->
           when (child) {
             node.modifierList -> doAccept(node.throwsList)
@@ -2181,12 +2135,6 @@ private open class Psi2kTranslator(
       generateSequence(firstChild) { it.nextSibling }
 
     fun <K : Any, V> Map<out K, V>.getOrNull(key: K?): V? = if (key != null) get(key) else null
-
-    fun PsiMethod.isOverrideEquivalentTo(other: PsiMethod): Boolean {
-      if (isEquivalentTo(other)) return true
-      if (isStatic || other.isStatic || name != other.name) return false
-      return areSignaturesEqual(this, other)
-    }
 
     private fun PsiFile.isPackageDefaultImported(packageName: String): Boolean {
       return packageName in DEFAULT_IMPORTED_PACKAGES ||
