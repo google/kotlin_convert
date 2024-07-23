@@ -17,9 +17,11 @@
 package com.google.devtools.jvmtools.analysis.nullness
 
 import com.intellij.codeInsight.AnnotationTargetUtil.isTypeAnnotation
+import com.intellij.lang.java.JavaLanguage
 import com.intellij.psi.PsiAnnotation
 import com.intellij.psi.PsiAnnotationOwner
 import com.intellij.psi.PsiCapturedWildcardType
+import com.intellij.psi.PsiClass
 import com.intellij.psi.PsiClassType
 import com.intellij.psi.PsiDisjunctionType
 import com.intellij.psi.PsiElement
@@ -33,9 +35,18 @@ import com.intellij.psi.PsiTypeVisitor
 import com.intellij.psi.PsiTypes
 import com.intellij.psi.PsiWildcardType
 import com.intellij.psi.util.TypeConversionUtil
+import com.intellij.psi.util.parentOfType
 
 fun hasNullableAnno(owner: PsiModifierListOwner?): Boolean =
-  indicatesNullable(owner?.modifierList, useTypeAnnos = false)
+  // Kotlin emits declaration annotations only, even though org.jetbrains.annotations.Nullable
+  // is a type annotation, so honor type annotations if the owner isn't Java (b/354753804)
+  indicatesNullable(owner?.modifierList, useTypeAnnos = owner?.isJava() != true)
+
+/** Returns if the receiver is defined in Java. */
+private fun PsiModifierListOwner.isJava() =
+  language == JavaLanguage.INSTANCE &&
+    // Language is always Java if defined in binary, so additionally check for Kotlin metadata
+    parentOfType<PsiClass>(withSelf = true)?.hasAnnotation("kotlin.Metadata") != true
 
 fun indicatesNullable(owner: PsiAnnotationOwner?, useTypeAnnos: Boolean = true): Boolean =
   // applicableAnnotations is sometimes available where .annotations throws. Note it doesn't work
