@@ -94,9 +94,7 @@ object NullnessAnalysis {
 
   @VisibleForTesting
   internal fun CfgRoot.doAnalyze() =
-    analyze<State<Nullness>> { analysis ->
-      NullnessTransfer(analysis, State(Nullness.BOTTOM, initialStore(this)), rootNode)
-    }
+    analyze(State(Nullness.BOTTOM, initialStore(this))) { NullnessTransfer(it, rootNode) }
 
   /**
    * Returns the initial [Store] to use for the given analysis [root], which includes:
@@ -193,7 +191,6 @@ object NullnessAnalysis {
 /** Transfer function for tracking reference [Nullness] similar to how Kotlin would. */
 private class NullnessTransfer(
   private val analysis: UDataflowContext<State<Nullness>>,
-  override val initialState: State<Nullness>,
   root: UElement,
 ) : UTransferFunction<State<Nullness>> {
   override val bottom = State(Nullness.BOTTOM, Store())

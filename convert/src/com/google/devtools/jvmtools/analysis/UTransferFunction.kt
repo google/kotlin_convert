@@ -38,20 +38,28 @@ typealias TransferFactory<T> = (UDataflowContext<T>) -> UTransferFunction<T>
 /**
  * Analyzes this method with the [UTransferFunction] returned by [transferFactory].
  *
+ * @param initialState initial analysis state to use as the entry node's initial "before" state.
  * @param transferFactory returns [UTransferFunction] for this method, which (awkwardly) allows the
  *   transfer function to receive a reference back to the running analysis to query results.
  */
-fun <T : Value<T>> UMethod.analyze(transferFactory: TransferFactory<T>): UAnalysis<T> =
-  DataflowAnalysis(Cfg.create(this), transferFactory).also { it.runAnalysis() }
+fun <T : Value<T>> UMethod.analyze(
+  initialState: T,
+  transferFactory: TransferFactory<T>,
+): UAnalysis<T> =
+  DataflowAnalysis(Cfg.create(this), transferFactory).also { it.runAnalysis(initialState) }
 
 /**
  * Analyzes this [CfgRoot] with the [UTransferFunction] returned by [transferFactory].
  *
+ * @param initialState initial analysis state to use as the entry node's initial "before" state.
  * @param transferFactory returns [UTransferFunction] for this root, which (awkwardly) allows the
  *   transfer function to receive a reference back to the running analysis to query results.
  */
-fun <T : Value<T>> CfgRoot.analyze(transferFactory: TransferFactory<T>): UAnalysis<T> =
-  DataflowAnalysis(Cfg.create(this), transferFactory).also { it.runAnalysis() }
+fun <T : Value<T>> CfgRoot.analyze(
+  initialState: T,
+  transferFactory: TransferFactory<T>,
+): UAnalysis<T> =
+  DataflowAnalysis(Cfg.create(this), transferFactory).also { it.runAnalysis(initialState) }
 
 /**
  * Base class for dataflow transfer functions. Subclasses should override [CfgTypedVisitor] methods
@@ -83,10 +91,6 @@ interface UTransferFunction<T : Value<T>> : CfgTypedVisitor<TransferInput<T>, Tr
    * is available (e.g., in [UAnalysis.get]).
    */
   val bottom: T
-
-  /** Initial analysis state to use as the entry node's initial "before" state. */
-  // TODO(kmb): consider passing CFG's root node to allow reuse
-  val initialState: T
 
   /** Overridden to pass through the given [data] by default, joining any conditional inputs. */
   override fun visitElement(node: UElement, data: TransferInput<T>): TransferResult<T> =
@@ -313,9 +317,9 @@ private class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: Transfer
   private val transfer: UTransferFunction<T> = transferFactory(this)
   private val cfg: Cfg = if (transfer.isBackwards) cfg.reverse() else cfg
 
-  fun runAnalysis() {
+  fun runAnalysis(initialState: T) {
     val pending = mutableSetOf<UElement>()
-    before[cfg.entryNode] = TransferInput.Normal(transfer.initialState)
+    before[cfg.entryNode] = TransferInput.Normal(initialState)
     pending += cfg.entryNode
     while (pending.isNotEmpty()) {
       // Remove and transfer a node; add nodes to be visited as a result
