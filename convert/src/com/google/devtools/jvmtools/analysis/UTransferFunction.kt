@@ -365,6 +365,8 @@ private class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: Transfer
       ?: transfer.bottom
   }
 
+  override fun uastNodes(element: PsiElement): Collection<UElement> = cfg.sourceMapping[element]
+
   /** Removes and returns the collection's first element (as returned by its [MutableIterator]). */
   private fun <T> MutableCollection<T>.removeFirst(): T {
     val iter = iterator()

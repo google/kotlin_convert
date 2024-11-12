@@ -125,6 +125,7 @@ import org.jetbrains.kotlin.lexer.KtKeywordToken
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfType
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfTypes2
+import org.jetbrains.uast.UExpression
 import org.jetbrains.uast.UFile
 import org.jetbrains.uast.ULambdaExpression
 import org.jetbrains.uast.UMethod
@@ -1969,7 +1970,12 @@ private open class Psi2kTranslator(
     }
 
     fun PsiExpression.requiresNullable(): Boolean {
-      val value = nullness[this].value
+      val value =
+        nullness
+          .uastNodes(this)
+          .filterIsInstance<UExpression>()
+          .mapNotNull { nullness[it].value[it] }
+          .reduceOrNull(Nullness::join) ?: Nullness.BOTTOM
       return Nullness.NULL.implies(value) ||
         (value == Nullness.PARAMETRIC && noNullableBoundDeclared)
     }

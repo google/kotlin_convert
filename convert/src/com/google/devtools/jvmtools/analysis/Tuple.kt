@@ -18,62 +18,64 @@ package com.google.devtools.jvmtools.analysis
 
 import com.google.common.collect.ImmutableMap
 import com.google.errorprone.annotations.Immutable
+import com.google.errorprone.annotations.ImmutableTypeParameter
 import com.intellij.psi.PsiVariable
+import org.jetbrains.uast.UExpression
 
 /**
- * Tracks [T] values separately for each [PsiVariable], treating missing mappings equivalent to
+ * Tracks [V] values separately for each non-null key [K], treating missing mappings equivalent to
  * [bottom][Value.isBottom].
  */
 @Immutable
-data class Store<T : Value<T>>(
-  @Suppress("Immutable") // PsiVariable can't be annotated
-  private val contents: ImmutableMap<PsiVariable, T> = ImmutableMap.of()
-) : Value<Store<T>>, Map<PsiVariable, T> by contents {
-  constructor(values: Map<PsiVariable, T>) : this(ImmutableMap.copyOf(values))
+data class Tuple<@ImmutableTypeParameter K : Any, V : Value<V>>(
+  private val contents: ImmutableMap<K, V> = ImmutableMap.of()
+) : Value<Tuple<K, V>>, Map<K, V> by contents {
+  constructor(values: Map<K, V>) : this(ImmutableMap.copyOf(values))
 
   override val isBottom: Boolean
     get() = contents.values.all { it.isBottom } // trivially true if contents empty as desired
 
-  override fun join(other: Store<T>): Store<T> {
+  override fun join(other: Tuple<K, V>): Tuple<K, V> {
     val result = contents.toMutableMap()
     for ((k, v) in other.contents) {
       result.compute(k) { _, existing -> existing?.join(v) ?: v }
     }
-    return Store(result)
+    return Tuple(result)
   }
 
-  override fun implies(other: Store<T>): Boolean =
+  override fun implies(other: Tuple<K, V>): Boolean =
     contents.all { (k, v) ->
       val otherV = other[k]
       if (otherV != null) v.implies(otherV) else v.isBottom
     }
 
   /**
-   * Returns a [Store] identical to this one except mapping the given [key] to the given [value].
+   * Returns a [Tuple] identical to this one except mapping the given [key] to the given [value].
    */
-  fun withMapping(key: PsiVariable, value: T): Store<T> {
+  fun withMapping(key: K, value: V): Tuple<K, V> {
     if (contents[key] == value) return this
     val newContents = contents.toMutableMap()
     newContents[key] = value
-    return Store(newContents)
+    return Tuple(newContents)
   }
 
-  /** Returns a [Store] identical to this one except for the given new mappings. */
-  operator fun plus(newMappings: Collection<Pair<PsiVariable, T>>): Store<T> {
+  /** Returns a [Tuple] identical to this one except for the given new mappings. */
+  operator fun plus(newMappings: Collection<Pair<K, V>>): Tuple<K, V> {
     if (newMappings.isEmpty()) return this
     val newContents = contents.toMutableMap()
     for ((key, value) in newMappings) newContents[key] = value
-    return Store(newContents)
+    return Tuple(newContents)
   }
 }
 
 /**
- * Pairs a [Store] with a [value]:
- * * [value] typically represents a node's own value (e.g., its nullness)
+ * Pairs a [store] with a [value] tuple:
+ * * [value] represents what we know about each expression at a given program point
  * * [store] tracks variables in scope
  */
 @Immutable
-data class State<T : Value<T>>(val value: T, val store: Store<T>) : Value<State<T>> {
+data class State<T : Value<T>>(val value: Tuple<UExpression, T>, val store: Tuple<PsiVariable, T>) :
+  Value<State<T>> {
   override val isBottom: Boolean
     get() = value.isBottom && store.isBottom
 

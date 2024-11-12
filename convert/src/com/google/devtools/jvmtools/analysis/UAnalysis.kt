@@ -30,6 +30,13 @@ interface PsiAnalysis<T> {
 interface UAnalysis<T> : PsiAnalysis<T> {
   /** Returns result for the given [node] assuming its successful execution. */
   operator fun get(node: UElement): T
+
+  /**
+   * Returns [UElement]s corresponding to the given source PSI [element].
+   *
+   * This helps querying `Tuple` results.
+   */
+  fun uastNodes(element: PsiElement): Collection<UElement>
 }
 
 /**

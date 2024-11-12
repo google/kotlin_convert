@@ -18,7 +18,6 @@ package com.google.devtools.jvmtools.analysis.nullness
 
 import com.google.devtools.jvmtools.convert.util.runIf
 import com.google.devtools.jvmtools.analysis.State
-import com.google.devtools.jvmtools.analysis.UDataflowContext
 import com.google.devtools.jvmtools.analysis.join
 import com.intellij.psi.JavaPsiFacade
 import com.intellij.psi.PsiArrayType
@@ -60,7 +59,7 @@ import org.jetbrains.uast.visitor.UastTypedVisitor
  * @return inference result or `null` if inference wasn't able to produce any information
  */
 internal fun UExpression.resultNullness(
-  analysis: UDataflowContext<State<Nullness>>,
+  analysis: State<Nullness>,
   vararg selector: PsiTypeParameter?,
 ): Nullness? = accept(TypeArgumentVisitor(this, analysis), selector.toList())
 
@@ -89,7 +88,7 @@ private typealias TypeComponentSelector = List<PsiTypeParameter?>
  */
 private class TypeArgumentVisitor(
   private val startNode: UExpression,
-  private val analysis: UDataflowContext<State<Nullness>>,
+  private val analysis: State<Nullness>,
 ) : UastTypedVisitor<TypeComponentSelector, Nullness?> {
   override fun visitElement(node: UElement, data: TypeComponentSelector): Nullness? {
     TODO("Not yet implemented: $node $data")
@@ -97,7 +96,7 @@ private class TypeArgumentVisitor(
 
   override fun visitExpression(node: UExpression, data: TypeComponentSelector): Nullness? =
     if (node != startNode && data.isEmpty()) {
-      analysis[node].value
+      analysis.value[node]
     } else {
       expressionTypeNullness(node, data)
     }
@@ -110,7 +109,7 @@ private class TypeArgumentVisitor(
 
   override fun visitCallExpression(node: UCallExpression, data: TypeComponentSelector): Nullness? {
     if (node != startNode && data.isEmpty()) {
-      return analysis[node].value
+      return analysis.value[node]
     }
 
     when (node.kind) {
@@ -330,7 +329,7 @@ private class TypeArgumentVisitor(
     data: TypeComponentSelector,
   ): Nullness? =
     if (node != startNode && data.isEmpty()) {
-      analysis[node].value
+      analysis.value[node]
     } else {
       node.receiver.accept(this, ARRAY_COMPONENT_SELECTOR + data)
     }

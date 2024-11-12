@@ -23,14 +23,12 @@ import com.google.devtools.jvmtools.analysis.CfgForeachIteratedExpression
 import com.google.devtools.jvmtools.analysis.CfgRoot
 import com.google.devtools.jvmtools.analysis.CfgSwitchBranchExpression
 import com.google.devtools.jvmtools.analysis.State
-import com.google.devtools.jvmtools.analysis.Store
 import com.google.devtools.jvmtools.analysis.TransferInput
 import com.google.devtools.jvmtools.analysis.TransferResult
+import com.google.devtools.jvmtools.analysis.Tuple
 import com.google.devtools.jvmtools.analysis.UAnalysis
-import com.google.devtools.jvmtools.analysis.UDataflowContext
 import com.google.devtools.jvmtools.analysis.UTransferFunction
 import com.google.devtools.jvmtools.analysis.analyze
-import com.google.devtools.jvmtools.analysis.passthroughResult
 import com.intellij.lang.java.JavaLanguage
 import com.intellij.psi.PsiArrayType
 import com.intellij.psi.PsiClass
@@ -94,15 +92,16 @@ object NullnessAnalysis {
 
   @VisibleForTesting
   internal fun CfgRoot.doAnalyze() =
-    analyze(State(Nullness.BOTTOM, initialStore(this))) { NullnessTransfer(it, rootNode) }
+    @Suppress("Immutable") // PSI & UAST can't be annotated
+    analyze(State(Tuple(), initialStore(this))) { _ -> NullnessTransfer(rootNode) }
 
   /**
-   * Returns the initial [Store] to use for the given analysis [root], which includes:
+   * Returns the initial [store][State.store] to use for the given analysis [root], which includes:
    * 1. the given root's parameters based on their annotations, and
    * 2. any captured final variables with the inferred analysis result at the point in the outer
    *    scope where the variable is captured.
    */
-  private fun initialStore(root: CfgRoot): Store<Nullness> {
+  private fun initialStore(root: CfgRoot): Tuple<PsiVariable, Nullness> {
     val storeContents = mutableMapOf<PsiVariable, Nullness>()
     @Suppress("DEPRECATION") // .psi gives us a PsiParameter
     when (root) {
@@ -116,7 +115,8 @@ object NullnessAnalysis {
       // In Java, captured variables are effectively final; otherwise, exclude non-final variables
       seen.removeIf { !it.hasModifierProperty(PsiModifier.FINAL) }
     }
-    if (seen.isEmpty()) return Store(storeContents) // no captured variables
+    @Suppress("Immutable") // PSI & UAST can't be annotated
+    if (seen.isEmpty()) return Tuple(storeContents) // no captured variables
 
     // Node to query analysis results at, which is the enclosing object literal or lambda
     var query: UExpression? =
@@ -138,7 +138,8 @@ object NullnessAnalysis {
         query = queryRoot
       }
     }
-    return Store(storeContents)
+    @Suppress("Immutable") // PSI & UAST can't be annotated
+    return Tuple(storeContents)
   }
 
   private fun referencedVariables(root: CfgRoot): MutableSet<PsiVariable> {
@@ -173,7 +174,7 @@ object NullnessAnalysis {
     return seen
   }
 
-  private fun Store<Nullness>.addAvailableKeys(
+  private fun Tuple<PsiVariable, Nullness>.addAvailableKeys(
     dest: MutableMap<PsiVariable, Nullness>,
     wanted: MutableSet<PsiVariable>,
   ) {
@@ -189,11 +190,9 @@ object NullnessAnalysis {
 }
 
 /** Transfer function for tracking reference [Nullness] similar to how Kotlin would. */
-private class NullnessTransfer(
-  private val analysis: UDataflowContext<State<Nullness>>,
-  root: UElement,
-) : UTransferFunction<State<Nullness>> {
-  override val bottom = State(Nullness.BOTTOM, Store())
+private class NullnessTransfer(root: UElement) : UTransferFunction<State<Nullness>> {
+  @Suppress("Immutable") // PSI & UAST can't be annotated
+  override val bottom = State<Nullness>(Tuple(), Tuple())
 
   private val javaLangIterable: PsiClass by lazy {
     PsiType.getTypeByName(
@@ -211,9 +210,10 @@ private class NullnessTransfer(
     node: ULocalVariable,
     data: TransferInput<State<Nullness>>,
   ): TransferResult<State<Nullness>> {
-    val value = node.uastInitializer?.let { analysis[it].value } ?: Nullness.BOTTOM
+    val state = data.value()
+    val value = node.uastInitializer?.let { state.value[it] } ?: Nullness.BOTTOM
     @Suppress("DEPRECATION") // .psi gives us a PsiLocalVariable
-    return data.value().store.withMapping(node.psi, value).toNormalResult(Nullness.BOTTOM)
+    return TransferResult.normal(State(state.value, state.store.withMapping(node.psi, value)))
   }
 
   @Suppress("DEPRECATION") // .psi gives us a PsiParameter
@@ -221,17 +221,18 @@ private class NullnessTransfer(
     node: UParameter,
     data: TransferInput<State<Nullness>>,
   ): TransferResult<State<Nullness>> {
+    val state = data.value()
     val value =
       when (val parent = node.uastParent) {
         is UMethod,
         is ULambdaExpression -> {
-          check(data.value().store.containsKey(node.psi)) {
+          check(state.store.containsKey(node.psi)) {
             "Method & lambda parameters should be in initial state, but $node missing: $data"
           }
           return super.visitParameter(node, data)
         }
         is UForEachExpression -> {
-          parent.iteratedValue.resultNullness(analysis, javaLangIterable.typeParameters[0])
+          parent.iteratedValue.resultNullness(state, javaLangIterable.typeParameters[0])
             ?: run {
               val iteratedType =
                 when (val iterableType = parent.iteratedValue.getExpressionType()) {
@@ -245,15 +246,16 @@ private class NullnessTransfer(
         }
         else -> Nullness.NONULL // most parameters are non-null, e.g., caught exceptions
       }
-    return data.value().store.toNormalResult(Nullness.BOTTOM) { withMapping(node.psi, value) }
+    return TransferResult.normal(State(state.value, state.store.withMapping(node.psi, value)))
   }
 
   override fun visitArrayAccessExpression(
     node: UArrayAccessExpression,
     data: TransferInput<State<Nullness>>,
   ): TransferResult<State<Nullness>> {
-    val value = node.resultNullness(analysis) ?: nullnessFromAnnotation(node.getExpressionType())
-    return data.value().store.toNormalResult(value, dereference = node.receiver)
+    val state = data.value()
+    val value = node.resultNullness(state) ?: nullnessFromAnnotation(node.getExpressionType())
+    return state.toNormalResult(node, value, dereference = node.receiver)
   }
 
   override fun visitBinaryExpression(
@@ -261,8 +263,9 @@ private class NullnessTransfer(
     data: TransferInput<State<Nullness>>,
   ): TransferResult<State<Nullness>> {
     fun identityEqualityStore(): State<Nullness> {
+      val state = data.value()
       val impliedNullness =
-        analysis[node.leftOperand].value equate analysis[node.rightOperand].value
+        state.valueOrBottom(node.leftOperand) equate state.valueOrBottom(node.rightOperand)
       return if (impliedNullness == Nullness.BOTTOM) {
         bottom // Contradiction, so return bottom
       } else {
@@ -272,13 +275,14 @@ private class NullnessTransfer(
               node.leftOperand.resolveTrackedVariable()?.let { it to impliedNullness },
               node.rightOperand.resolveTrackedVariable()?.let { it to impliedNullness },
             )
-        State(Nullness.NONULL, store)
+        State(state.value.withMapping(node, Nullness.NONULL), store)
       }
     }
 
     fun identityInequalityStore(): State<Nullness> {
-      var leftNullness = analysis[node.leftOperand].value
-      var rightNullness = analysis[node.rightOperand].value
+      val state = data.value()
+      var leftNullness = state.valueOrBottom(node.leftOperand)
+      var rightNullness = state.valueOrBottom(node.rightOperand)
       if (leftNullness == Nullness.NULL) rightNullness = rightNullness equate Nullness.NONULL
       if (rightNullness == Nullness.NULL) leftNullness = leftNullness equate Nullness.NONULL
 
@@ -291,7 +295,7 @@ private class NullnessTransfer(
               node.leftOperand.resolveTrackedVariable()?.let { it to leftNullness },
               node.rightOperand.resolveTrackedVariable()?.let { it to rightNullness },
             )
-        State(Nullness.NONULL, store)
+        State(state.value.withMapping(node, Nullness.NONULL), store)
       }
     }
 
@@ -313,12 +317,16 @@ private class NullnessTransfer(
       TransferResult.conditional(
         trueValue =
           State(
-            Nullness.NONULL,
+            data.value(condition = true).value.withMapping(node, Nullness.NONULL),
             data.value(condition = true).store +
               listOfNotNull(node.operand.resolveTrackedVariable()?.let { it to Nullness.NONULL }),
           ),
-        falseValue = State(Nullness.NONULL, data.value(condition = false).store),
-        exceptionalValues = mapOf(throwableType to State(Nullness.BOTTOM, data.value().store)),
+        falseValue =
+          State(
+            data.value(condition = false).value.withMapping(node, Nullness.NONULL),
+            data.value(condition = false).store,
+          ),
+        exceptionalValues = mapOf(throwableType to data.value()),
       )
     } else {
       super.visitBinaryExpressionWithType(node, data)
@@ -331,10 +339,11 @@ private class NullnessTransfer(
   ): TransferResult<State<Nullness>> {
     return when {
       node.operator == UastBinaryOperator.ASSIGN -> {
+        val state = data.value()
         val lastOperand =
-          node.operands.lastOrNull() ?: return data.value().store.toNormalResult(Nullness.BOTTOM)
-        val value = analysis[lastOperand].value
-        data.value().store.toNormalResult(value) {
+          node.operands.lastOrNull() ?: return state.toNormalResult(node, Nullness.BOTTOM)
+        val value = state.valueOrBottom(lastOperand)
+        state.toNormalResult(node, value) {
           this +
             node.operands.dropLast(1).mapNotNull { operand ->
               operand.resolveTrackedVariable()?.let { it to value }
@@ -344,15 +353,23 @@ private class NullnessTransfer(
       data.isConditional && node.getExpressionType() == PsiTypes.booleanType() -> {
         // Other operators return nonnull values, but preserve conditional results for Booleans
         TransferResult.conditional(
-          trueValue = State(Nullness.NONULL, data.value(condition = true).store),
-          falseValue = State(Nullness.NONULL, data.value(condition = false).store),
-          exceptionalValues = mapOf(throwableType to State(Nullness.BOTTOM, data.value().store)),
+          trueValue =
+            State(
+              data.value(condition = true).value.withMapping(node, Nullness.NONULL),
+              data.value(condition = true).store,
+            ),
+          falseValue =
+            State(
+              data.value(condition = false).value.withMapping(node, Nullness.NONULL),
+              data.value(condition = false).store,
+            ),
+          exceptionalValues = mapOf(throwableType to data.value()),
         )
       }
       else -> {
         // Other operators return nonnull values
         // TODO(b/308816245): consider lhs of compound assignments non-null
-        data.value().store.toNormalResult(Nullness.NONULL)
+        data.value().toNormalResult(node, Nullness.NONULL)
       }
     }
   }
@@ -361,58 +378,67 @@ private class NullnessTransfer(
     if (node.operator == UastPrefixOperator.LOGICAL_NOT && data.isConditional) {
       // Flip conditional stores; result is always non-null boolean
       TransferResult.conditional(
-        trueValue = State(Nullness.NONULL, data.value(condition = false).store),
-        falseValue = State(Nullness.NONULL, data.value(condition = true).store),
-        exceptionalValues = mapOf(throwableType to State(Nullness.BOTTOM, data.value().store)),
+        trueValue =
+          State(
+            data.value(condition = false).value.withMapping(node, Nullness.NONULL),
+            data.value(condition = false).store,
+          ),
+        falseValue =
+          State(
+            data.value(condition = true).value.withMapping(node, Nullness.NONULL),
+            data.value(condition = true).store,
+          ),
+        exceptionalValues = mapOf(throwableType to data.value()),
       )
     } else {
-      data.value().store.toNormalResult(Nullness.NONULL)
+      data.value().toNormalResult(node, Nullness.NONULL)
     }
 
   override fun visitIfExpression(
     node: UIfExpression,
     data: TransferInput<State<Nullness>>,
   ): TransferResult<State<Nullness>> {
+    val state = data.value()
     val value =
       if (node.isTernary) {
-        analysis[node.thenExpression ?: node.condition]
-          .value
-          .join(analysis[node.elseExpression ?: node.condition].value)
+        state
+          .valueOrBottom(node.thenExpression ?: node.condition)
+          .join(state.valueOrBottom(node.elseExpression ?: node.condition))
       } else {
         Nullness.BOTTOM
       }
-    return data.value().store.toNormalResult(value)
+    return data.value().toNormalResult(node, value)
   }
 
   override fun visitLiteralExpression(
     node: ULiteralExpression,
     data: TransferInput<State<Nullness>>,
-  ) = data.value().store.toNormalResult(if (node.isNull) Nullness.NULL else Nullness.NONULL)
+  ) = data.value().toNormalResult(node, if (node.isNull) Nullness.NULL else Nullness.NONULL)
 
   override fun visitClassLiteralExpression(
     node: UClassLiteralExpression,
     data: TransferInput<State<Nullness>>,
-  ) = data.value().store.toNormalResult(Nullness.NONULL)
+  ) = data.value().toNormalResult(node, Nullness.NONULL)
 
   override fun visitLambdaExpression(
     node: ULambdaExpression,
     data: TransferInput<State<Nullness>>,
-  ) = data.value().store.toNormalResult(Nullness.NONULL)
+  ) = data.value().toNormalResult(node, Nullness.NONULL)
 
   override fun visitCallableReferenceExpression(
     node: UCallableReferenceExpression,
     data: TransferInput<State<Nullness>>,
   ) =
     // Callable references are non-null (like lambdas) but implicitly dereference any qualifier
-    data.value().store.toNormalResult(Nullness.NONULL, dereference = node.qualifierExpression)
+    data.value().toNormalResult(node, Nullness.NONULL, dereference = node.qualifierExpression)
 
   override fun visitThisExpression(node: UThisExpression, data: TransferInput<State<Nullness>>) =
     // `this` references are non-null
-    data.value().store.toNormalResult(Nullness.NONULL)
+    data.value().toNormalResult(node, Nullness.NONULL)
 
   override fun visitSuperExpression(node: USuperExpression, data: TransferInput<State<Nullness>>) =
     // `super` like `this` references are non-null
-    data.value().store.toNormalResult(Nullness.NONULL)
+    data.value().toNormalResult(node, Nullness.NONULL)
 
   override fun visitCallExpression(
     node: UCallExpression,
@@ -425,14 +451,14 @@ private class NullnessTransfer(
         node.kind == UastCallKind.NESTED_ARRAY_INITIALIZER
     ) {
       // New objects are non-null (including arrays)
-      return data.value().store.toNormalResult(Nullness.NONULL)
+      return data.value().toNormalResult(node, Nullness.NONULL)
     }
 
+    val state = data.value()
     val value =
-      node.resultNullness(analysis)
-        ?: nullnessFromAnnotation(node.getExpressionType(), node.resolve())
+      node.resultNullness(state) ?: nullnessFromAnnotation(node.getExpressionType(), node.resolve())
     // TODO(b/308816245): havoc fields once we track them
-    return data.value().store.toNormalResult(value, dereference = node.receiver)
+    return state.toNormalResult(node, value, dereference = node.receiver)
   }
 
   override fun visitQualifiedReferenceExpression(
@@ -442,7 +468,8 @@ private class NullnessTransfer(
     if (node.selector is UCallExpression) {
       // foo.bar() is modeled as a UQualifiedReferenceExpression containing a UCallExpression,
       // so pass through the UCallExpression's result instead of recalculating it
-      data.passthroughResult(node)
+      val state = data.value()
+      state.toNormalResult(node, state.valueOrBottom(node.selector))
     } else {
       visitReferenceExpression(node, data)
     }
@@ -451,11 +478,12 @@ private class NullnessTransfer(
     node: UReferenceExpression,
     data: TransferInput<State<Nullness>>,
   ): TransferResult<State<Nullness>> {
-    val store = data.value().store
+    val state = data.value()
     val referee = node.resolve() as? PsiModifierListOwner
     // TODO(b/308816245): track fields
-    val value = store[referee] ?: nullnessFromAnnotation(node.getExpressionType(), referee)
-    return store.toNormalResult(
+    val value = state.store[referee] ?: nullnessFromAnnotation(node.getExpressionType(), referee)
+    return state.toNormalResult(
+      node,
       value,
       dereference = (node as? UQualifiedReferenceExpression)?.receiver,
     )
@@ -464,12 +492,12 @@ private class NullnessTransfer(
   override fun visitCfgForeachIteratedExpression(
     node: CfgForeachIteratedExpression,
     data: TransferInput<State<Nullness>>,
-  ) = data.value().store.toNormalResult(Nullness.NONULL, dereference = node.wrappedExpression)
+  ) = data.value().toNormalResult(node, Nullness.NONULL, dereference = node.wrappedExpression)
 
   override fun visitCfgSwitchBranchExpression(
     node: CfgSwitchBranchExpression,
     data: TransferInput<State<Nullness>>,
-  ) = data.value().store.toNormalResult(Nullness.NONULL, dereference = node.wrappedExpression)
+  ) = data.value().toNormalResult(node, Nullness.NONULL, dereference = node.wrappedExpression)
 
   /**
    * Returns a [TransferResult.normal] based on this one with the given [State.value] that
@@ -478,22 +506,30 @@ private class NullnessTransfer(
    * If [dereference] resolves to a variable, that variable is marked as non-null in the result;
    * otherwise, the given store is included in the result as-is.
    */
-  private fun Store<Nullness>.toNormalResult(value: Nullness, dereference: UExpression?) =
-    toNormalResult(value) {
+  private fun State<Nullness>.toNormalResult(
+    node: UExpression,
+    newValue: Nullness,
+    dereference: UExpression?,
+  ) =
+    toNormalResult(node, newValue) {
       val dereferenced = dereference?.resolveTrackedVariable()
       if (dereferenced != null) withMapping(dereferenced, Nullness.NONULL) else this
     }
 
-  private inline fun Store<Nullness>.toNormalResult(
-    value: Nullness,
-    updateStore: Store<Nullness>.() -> Store<Nullness> = { this },
+  private inline fun State<Nullness>.toNormalResult(
+    node: UExpression,
+    newValue: Nullness,
+    updateStore: Tuple<PsiVariable, Nullness>.() -> Tuple<PsiVariable, Nullness> = { store },
   ) =
     TransferResult.normal(
-      State(value, updateStore()),
-      exceptionalValues = mapOf(throwableType to State(Nullness.BOTTOM, this)),
+      State(value.withMapping(node, newValue), store.updateStore()),
+      exceptionalValues = mapOf(throwableType to this),
     )
 
   private companion object {
+    fun State<Nullness>.valueOrBottom(expression: UExpression): Nullness =
+      value[expression] ?: Nullness.BOTTOM
+
     fun UExpression.resolveTrackedVariable(): PsiVariable? = accept(ResolveTrackedVariable, Unit)
   }
 
