@@ -306,7 +306,7 @@ fun <T : Value<T>> TransferInput<T>.passthroughResult(node: UExpression): Transf
  *
  * @param T abstract values being tracked
  */
-private class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: TransferFactory<T>) :
+internal class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: TransferFactory<T>) :
   UDataflowContext<T> {
   private val before = mutableMapOf<UElement, TransferInput<T>>()
   private val after = mutableMapOf<UElement, TransferResult<T>>()
@@ -315,7 +315,7 @@ private class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: Transfer
   // will likely fail as it usually requires `cfg`, which in turn requires `transfer.isBackwards`.
   // A better solution would be nice, but in practice this usually works.
   private val transfer: UTransferFunction<T> = transferFactory(this)
-  private val cfg: Cfg = if (transfer.isBackwards) cfg.reverse() else cfg
+  val cfg: Cfg = if (transfer.isBackwards) cfg.reverse() else cfg
 
   fun runAnalysis(initialState: T) {
     val pending = mutableSetOf<UElement>()
@@ -366,12 +366,12 @@ private class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: Transfer
   }
 
   override fun uastNodes(element: PsiElement): Collection<UElement> = cfg.sourceMapping[element]
+}
 
-  /** Removes and returns the collection's first element (as returned by its [MutableIterator]). */
-  private fun <T> MutableCollection<T>.removeFirst(): T {
-    val iter = iterator()
-    val result = iter.next()
-    iter.remove()
-    return result
-  }
+/** Removes and returns the collection's first element (as returned by its [MutableIterator]). */
+internal fun <T> MutableCollection<T>.removeFirst(): T {
+  val iter = iterator()
+  val result = iter.next()
+  iter.remove()
+  return result
 }

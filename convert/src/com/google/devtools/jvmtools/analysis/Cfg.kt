@@ -20,6 +20,7 @@ import com.google.common.collect.HashBasedTable
 import com.google.common.collect.HashMultimap
 import com.google.common.collect.ImmutableMultimap
 import com.google.errorprone.annotations.CanIgnoreReturnValue
+import com.google.errorprone.annotations.Immutable
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiType
 import com.intellij.psi.PsiTypes
@@ -75,7 +76,8 @@ data class Cfg
 private constructor(
   /** The unique first ("entry") node in the [Cfg]. */
   val entryNode: UElement,
-  private val exitNode: UElement,
+  /** The unique last ("exit", or sink) node in the [Cfg]. */
+  val exitNode: UElement,
   private val forwardEdges: ImmutableMultimap<UElement, UElement>,
   private val edgeConditions: (UElement, UElement) -> CfgEdgeLabel?,
   /** Allows finding [PsiElement]s in a [Cfg]. */
@@ -132,13 +134,18 @@ private constructor(
 }
 
 /** Type safe wrapper for root node to build CFG from. */
-sealed class CfgRoot {
+@Immutable
+sealed class CfgRoot : CfgRootKey {
   /** The root node, whose type is refined in the sealed subtypes. */
   abstract val rootNode: UElement
 
-  data class Method(override val rootNode: UMethod) : CfgRoot()
+  // A CfgRoot is a trivial CfgRootKey for itself
+  override val callee: CfgRoot
+    get() = this
 
-  data class Lambda(override val rootNode: ULambdaExpression) : CfgRoot()
+  data class Method(@Suppress("Immutable") override val rootNode: UMethod) : CfgRoot()
+
+  data class Lambda(@Suppress("Immutable") override val rootNode: ULambdaExpression) : CfgRoot()
 
   companion object {
     fun of(rootNode: UMethod) = Method(rootNode)
@@ -254,6 +261,23 @@ internal sealed interface CfgEdgeLabel {
     internal fun exceptionalEdge(firstThrown: PsiType) =
       CfgExceptionalEdge(mutableSetOf(firstThrown))
   }
+}
+
+/**
+ * Interface for defining hashable keys that reference a [CfgRoot] in [callee].
+ *
+ * Note [CfgRoot] itself can trivially implement this interface, but this allows including
+ * additional properties in the key. Non-[equal][equals] keys can reference the same [callee].
+ */
+// This interface is defined here to avoid circular references between source files.
+@Immutable
+interface CfgRootKey {
+  /** [CfgRoot] referenced by this key. */
+  val callee: CfgRoot
+
+  override fun equals(other: Any?): Boolean
+
+  override fun hashCode(): Int
 }
 
 private class CfgBuilder(private val root: UElement) : UastVisitor {
