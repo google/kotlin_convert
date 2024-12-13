@@ -16,19 +16,19 @@
 
 package com.google.devtools.jvmtools.analysis.nullness
 
-import com.github.benmanes.caffeine.cache.Caffeine
-import com.google.common.annotations.VisibleForTesting
 import com.google.devtools.jvmtools.convert.util.runIf
 import com.google.devtools.jvmtools.analysis.CfgForeachIteratedExpression
 import com.google.devtools.jvmtools.analysis.CfgRoot
 import com.google.devtools.jvmtools.analysis.CfgSwitchBranchExpression
+import com.google.devtools.jvmtools.analysis.InterproceduralAnalysisBuilder
+import com.google.devtools.jvmtools.analysis.InterproceduralResult
 import com.google.devtools.jvmtools.analysis.State
 import com.google.devtools.jvmtools.analysis.TransferInput
 import com.google.devtools.jvmtools.analysis.TransferResult
 import com.google.devtools.jvmtools.analysis.Tuple
 import com.google.devtools.jvmtools.analysis.UAnalysis
+import com.google.devtools.jvmtools.analysis.UInterproceduralAnalysisContext
 import com.google.devtools.jvmtools.analysis.UTransferFunction
-import com.google.devtools.jvmtools.analysis.analyze
 import com.intellij.lang.java.JavaLanguage
 import com.intellij.psi.PsiArrayType
 import com.intellij.psi.PsiClass
@@ -51,6 +51,7 @@ import org.jetbrains.uast.UClass
 import org.jetbrains.uast.UClassLiteralExpression
 import org.jetbrains.uast.UElement
 import org.jetbrains.uast.UExpression
+import org.jetbrains.uast.UFile
 import org.jetbrains.uast.UForEachExpression
 import org.jetbrains.uast.UIfExpression
 import org.jetbrains.uast.ULambdaExpression
@@ -78,36 +79,83 @@ import org.jetbrains.uast.visitor.UastTypedVisitor
 
 /** [Nullness] dataflow [UAnalysis] that aims to imitate Kotlin's nullness type system. */
 object NullnessAnalysis {
-  /** Simple cache to avoid re-analyzing the same method over and over. */
-  private val cache =
-    Caffeine.newBuilder().maximumSize(100L).build<UElement, UAnalysis<State<Nullness>>>()
+  @Suppress("Immutable") // PSI & UAST can't be annotated
+  internal val BOTTOM = State<Nullness>(Tuple(), Tuple())
 
-  /** Returns analysis results for this method. */
-  fun UMethod.nullness(): UAnalysis<State<Nullness>> =
-    cache.get(this) { _ -> CfgRoot.of(this).doAnalyze() }
+  fun UFile.nullness(): InterproceduralResult<CfgRoot, State<Nullness>> {
+    val result =
+      InterproceduralAnalysisBuilder<CfgRoot, State<Nullness>>(BOTTOM) { ctx ->
+        NullnessTransfer(
+          root = ctx.analysisKey.callee.rootNode,
+          analyzeLambda = { ctx.dataflowResult(CfgRoot.of(it))[it] },
+        )
+      }
+    accept(
+      object : AbstractUastVisitor() {
+        override fun visitMethod(node: UMethod): Boolean {
+          if (node.sourcePsi != null) {
+            val root = CfgRoot.of(node)
+            result.addRoot(root) { ctx -> ctx.initialState(root) }
+          }
+          return super.visitMethod(node)
+        }
 
-  /** Returns analysis results for this lambda. */
-  fun ULambdaExpression.nullness(): UAnalysis<State<Nullness>> =
-    cache.get(this) { _ -> CfgRoot.of(this).doAnalyze() }
+        override fun visitLambdaExpression(node: ULambdaExpression): Boolean {
+          // We'll usually visit lambdas in the course of analyzing the surrounding method, but to
+          // guarantee data for all lambdas we also treat them as roots.
+          val root = CfgRoot.of(node)
+          result.addRoot(root) { ctx -> ctx.initialState(root) }
+          return super.visitLambdaExpression(node)
+        }
+      }
+    )
+    return result.build()
+  }
 
-  @VisibleForTesting
-  internal fun CfgRoot.doAnalyze() =
-    @Suppress("Immutable") // PSI & UAST can't be annotated
-    analyze(State(Tuple(), initialStore(this))) { _ -> NullnessTransfer(rootNode) }
+  private fun UInterproceduralAnalysisContext<CfgRoot, State<Nullness>>.dataflowResult(
+    root: CfgRoot
+  ): UAnalysis<State<Nullness>> = dataflowResult(root, initialState(root))
 
   /**
-   * Returns the initial [store][State.store] to use for the given analysis [root], which includes:
+   * Returns the initial [State.store] to use for the given analysis [root], which includes:
    * 1. the given root's parameters based on their annotations, and
    * 2. any captured final variables with the inferred analysis result at the point in the outer
    *    scope where the variable is captured.
    */
-  private fun initialStore(root: CfgRoot): Tuple<PsiVariable, Nullness> {
+  private fun UInterproceduralAnalysisContext<CfgRoot, State<Nullness>>.initialState(
+    root: CfgRoot
+  ): State<Nullness> {
     val storeContents = mutableMapOf<PsiVariable, Nullness>()
+
     @Suppress("DEPRECATION") // .psi gives us a PsiParameter
     when (root) {
       is CfgRoot.Method -> root.rootNode.uastParameters
       is CfgRoot.Lambda -> root.rootNode.valueParameters
     }.associateTo(storeContents) { it.psi to nullnessFromAnnotation(it.type, it) }
+
+    if (root is CfgRoot.Lambda) {
+      // Try to refine lambda parameters based on surrounding call arguments
+      val enclosing =
+        when (
+          val rootNode =
+            root.rootNode.getParentOfType(
+              strict = true,
+              UMethod::class.java,
+              ULambdaExpression::class.java,
+            )
+        ) {
+          is UMethod -> CfgRoot.of(rootNode)
+          is ULambdaExpression -> CfgRoot.of(rootNode)
+          else -> null
+        }
+      if (enclosing != null) {
+        root.rootNode.refineFromArguments(
+          storeContents,
+          analysis = { dataflowResult(enclosing)[it] },
+          analyzeLambda = { dataflowResult(CfgRoot.of(it))[it] },
+        )
+      }
+    }
 
     val seen = referencedVariables(root)
     seen.removeAll(storeContents.keys)
@@ -116,7 +164,7 @@ object NullnessAnalysis {
       seen.removeIf { !it.hasModifierProperty(PsiModifier.FINAL) }
     }
     @Suppress("Immutable") // PSI & UAST can't be annotated
-    if (seen.isEmpty()) return Tuple(storeContents) // no captured variables
+    if (seen.isEmpty()) return State(Tuple(), Tuple(storeContents)) // no captured variables
 
     // Node to query analysis results at, which is the enclosing object literal or lambda
     var query: UExpression? =
@@ -129,17 +177,19 @@ object NullnessAnalysis {
     while (seen.isNotEmpty() && query != null && queryRoot != null) {
       queryRoot = queryRoot.uastParent
       if (queryRoot is UMethod) {
-        queryRoot.nullness()[query].store.addAvailableKeys(storeContents, seen)
+        val cfgRoot = CfgRoot.of(queryRoot)
+        dataflowResult(cfgRoot)[query].store.addAvailableKeys(storeContents, seen)
         // Continue with enclosing object literal if any
         query = queryRoot.getParentOfType<UObjectLiteralExpression>()
         queryRoot = query
       } else if (queryRoot is ULambdaExpression) {
-        queryRoot.nullness()[query].store.addAvailableKeys(storeContents, seen)
+        val cfgRoot = CfgRoot.of(queryRoot)
+        dataflowResult(cfgRoot)[query].store.addAvailableKeys(storeContents, seen)
         query = queryRoot
       }
     }
     @Suppress("Immutable") // PSI & UAST can't be annotated
-    return Tuple(storeContents)
+    return State(Tuple(), Tuple(storeContents))
   }
 
   private fun referencedVariables(root: CfgRoot): MutableSet<PsiVariable> {
@@ -190,9 +240,12 @@ object NullnessAnalysis {
 }
 
 /** Transfer function for tracking reference [Nullness] similar to how Kotlin would. */
-private class NullnessTransfer(root: UElement) : UTransferFunction<State<Nullness>> {
-  @Suppress("Immutable") // PSI & UAST can't be annotated
-  override val bottom = State<Nullness>(Tuple(), Tuple())
+private class NullnessTransfer(
+  private val root: UElement,
+  private val analyzeLambda: (ULambdaExpression) -> State<Nullness>,
+) : UTransferFunction<State<Nullness>> {
+  override val bottom: State<Nullness>
+    get() = NullnessAnalysis.BOTTOM
 
   private val javaLangIterable: PsiClass by lazy {
     PsiType.getTypeByName(
@@ -232,7 +285,11 @@ private class NullnessTransfer(root: UElement) : UTransferFunction<State<Nullnes
           return super.visitParameter(node, data)
         }
         is UForEachExpression -> {
-          parent.iteratedValue.resultNullness(state, javaLangIterable.typeParameters[0])
+          parent.iteratedValue.resultNullness(
+            state,
+            analyzeLambda,
+            javaLangIterable.typeParameters[0],
+          )
             ?: run {
               val iteratedType =
                 when (val iterableType = parent.iteratedValue.getExpressionType()) {
@@ -254,7 +311,8 @@ private class NullnessTransfer(root: UElement) : UTransferFunction<State<Nullnes
     data: TransferInput<State<Nullness>>,
   ): TransferResult<State<Nullness>> {
     val state = data.value()
-    val value = node.resultNullness(state) ?: nullnessFromAnnotation(node.getExpressionType())
+    val value =
+      node.resultNullness(state, analyzeLambda) ?: nullnessFromAnnotation(node.getExpressionType())
     return state.toNormalResult(node, value, dereference = node.receiver)
   }
 
@@ -423,7 +481,7 @@ private class NullnessTransfer(root: UElement) : UTransferFunction<State<Nullnes
   override fun visitLambdaExpression(
     node: ULambdaExpression,
     data: TransferInput<State<Nullness>>,
-  ) = data.value().toNormalResult(node, Nullness.NONULL)
+  ): TransferResult<State<Nullness>> = data.value().toNormalResult(node, Nullness.NONULL)
 
   override fun visitCallableReferenceExpression(
     node: UCallableReferenceExpression,
@@ -456,7 +514,8 @@ private class NullnessTransfer(root: UElement) : UTransferFunction<State<Nullnes
 
     val state = data.value()
     val value =
-      node.resultNullness(state) ?: nullnessFromAnnotation(node.getExpressionType(), node.resolve())
+      node.resultNullness(state, analyzeLambda)
+        ?: nullnessFromAnnotation(node.getExpressionType(), node.resolve())
     // TODO(b/308816245): havoc fields once we track them
     return state.toNormalResult(node, value, dereference = node.receiver)
   }

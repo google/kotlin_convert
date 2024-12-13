@@ -17,6 +17,9 @@
 package com.google.devtools.jvmtools.convert.psi2k
 
 import com.google.devtools.jvmtools.convert.util.runIf
+import com.google.devtools.jvmtools.analysis.CfgRoot
+import com.google.devtools.jvmtools.analysis.State
+import com.google.devtools.jvmtools.analysis.UAnalysis
 import com.google.devtools.jvmtools.analysis.canCompleteNormally
 import com.google.devtools.jvmtools.analysis.nullness.Nullness
 import com.google.devtools.jvmtools.analysis.nullness.NullnessAnalysis.nullness
@@ -135,7 +138,12 @@ import org.jetbrains.uast.toUElement
 import org.jetbrains.uast.toUElementOfType
 
 /** Translates the receiver file to Kotlin and returns the resulting text. */
-fun PsiFile.translateToKotlin(): String {
+fun UFile.translateToKotlin(): String {
+  val nullnessResults = nullness()
+  return sourcePsi.translateToKotlin { nullnessResults[it] }
+}
+
+private fun PsiFile.translateToKotlin(nullness: (CfgRoot) -> UAnalysis<State<Nullness>>): String {
   require(
     language == JavaLanguage.INSTANCE && name != "package-info.java" && name != "module-info.java"
   ) {
@@ -143,7 +151,7 @@ fun PsiFile.translateToKotlin(): String {
   }
   val result = StringBuilder()
   val visitedNodes = mutableMapOf<PsiElement, String>()
-  accept(Psi2kTranslator(PsiTranslationOutput(result), visitedNodes))
+  accept(Psi2kTranslator(PsiTranslationOutput(result), visitedNodes, nullness))
 
   // Make sure we translated all nodes, and no additional nodes
   val allNodes = mutableSetOf<PsiElement>()
@@ -220,6 +228,7 @@ private class PsiTranslationOutput(
 private open class Psi2kTranslator(
   private val data: PsiTranslationOutput,
   private val seen: MutableMap<PsiElement, String>,
+  private val nullness: (CfgRoot) -> UAnalysis<State<Nullness>>,
 ) : JavaElementVisitor() {
   /**
    * Helper for [skipRecursive] that recursively marks nodes as [seen] and copies comments and
@@ -327,7 +336,7 @@ private open class Psi2kTranslator(
     val buffer = StringBuilder()
     val companion = StringBuilder()
     val seen = mutableMapOf<PsiElement, String>()
-    return object : InterceptingTranslator(buffer, companion, seen) {
+    return object : InterceptingTranslator(buffer, companion, seen, nullness) {
       override fun acceptResult(mapping: InterceptingTranslator.() -> String) {
         this@Psi2kTranslator.data.append(this.mapping())
         for ((k, v) in seen) {
@@ -596,7 +605,7 @@ private open class Psi2kTranslator(
     seen(node)
 
     val companionOut = StringBuilder()
-    with(Psi2kTranslator(data.withCompanion(companionOut), seen)) {
+    with(Psi2kTranslator(data.withCompanion(companionOut), seen, nullness)) {
       node
         .children()
         .takeWhile { it != node.rBrace }
@@ -651,7 +660,7 @@ private open class Psi2kTranslator(
     node: PsiModifierListOwner,
     block: Psi2kTranslator.() -> Unit,
   ) {
-    with(if (node.isStatic) Psi2kTranslator(data.companion(), seen) else this) {
+    with(if (node.isStatic) Psi2kTranslator(data.companion(), seen, nullness) else this) {
       block()
       // Add trailing line feed if we're writing to the companion, since trailing whitespace won't
       // TODO(b/273549101): consider appending the actual whitespace that follows the given node
@@ -1659,7 +1668,7 @@ private open class Psi2kTranslator(
                 // translation. Note we can fall through to subsequent code blocks as well, so just
                 // keep going as long as fallthrough is possible, until we reach the end of the
                 // switch block.
-                with(Psi2kTranslator(data, seen = mutableMapOf())) {
+                with(Psi2kTranslator(data, seen = mutableMapOf(), nullness)) {
                   var lookahead: PsiElement? = blockElem.nextSibling
                   var inFallthroughBlock = false // wait until first non-PsiSwithLabelStmt
                   while (lookahead != null && lookahead.tokenOrNull() != "}") {
@@ -1959,8 +1968,8 @@ private open class Psi2kTranslator(
     val root = variable.getParentOfTypes2<PsiMethod, PsiLambdaExpression>() ?: return false
     val nullness =
       when (val rootNode = root.toUElement()) {
-        is UMethod -> rootNode.nullness()
-        is ULambdaExpression -> rootNode.nullness()
+        is UMethod -> nullness(CfgRoot.of(rootNode))
+        is ULambdaExpression -> nullness(CfgRoot.of(rootNode))
         else -> return false
       }
 
@@ -2158,8 +2167,9 @@ private open class Psi2kTranslator(
 // Psi2kTranslator
 private abstract class InterceptingTranslator(
   val buffer: StringBuilder,
-  val companion: StringBuilder,
-  val seen: MutableMap<PsiElement, String>,
-) : Psi2kTranslator(PsiTranslationOutput(buffer, companion), seen) {
+  companion: StringBuilder,
+  seen: MutableMap<PsiElement, String>,
+  nullness: (CfgRoot) -> UAnalysis<State<Nullness>>,
+) : Psi2kTranslator(PsiTranslationOutput(buffer, companion), seen, nullness) {
   abstract fun acceptResult(mapping: InterceptingTranslator.() -> String)
 }
