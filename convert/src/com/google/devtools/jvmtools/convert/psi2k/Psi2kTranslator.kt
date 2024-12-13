@@ -904,19 +904,24 @@ private open class Psi2kTranslator(
   override fun visitLiteralExpression(expression: PsiLiteralExpression) {
     // https://kotlinlang.org/docs/numbers.html#literal-constants-for-numbers
     var literalText = expression.text
-    if (expression.type == PsiType.DOUBLE && literalText.endsWith("d", ignoreCase = true)) {
-      // There's no 0d suffix in Kotlin (b/282171141), so use .0 instead. We could alternatively
-      // do this in visitJavaToken, somehow still making sure we're looking at a double literal.
-      literalText = literalText.dropLast(1)
-      if ('.' !in literalText) literalText += ".0"
-      expression.replaceWith(literalText)
-    } else if (expression.type?.equalsToText("java.lang.String") == true) {
-      // `$` need to be escaped if followed by a legal Kotlin identifier
-      // https://kotlinlang.org/docs/reference/grammar.html#Identifier
-      val escapeDollar = Regex("\\\$(?=[a-z_]|`[^\\r\\n`]+`)")
-      expression.replaceWith(literalText.replace(escapeDollar, Regex.escapeReplacement("\\\$")))
-    } else {
-      super.visitLiteralExpression(expression)
+    when {
+      expression.type == PsiType.DOUBLE && literalText.endsWith("d", ignoreCase = true) -> {
+        // There's no 0d suffix in Kotlin (b/282171141), so use .0 instead. We could alternatively
+        // do this in visitJavaToken, somehow still making sure we're looking at a double literal.
+        literalText = literalText.dropLast(1)
+        if ('.' !in literalText) literalText += ".0"
+        expression.replaceWith(literalText)
+      }
+      // Interpreting Java text blocks is complex, and preserving them can be wrong (b/379714480),
+      // so convert to their effective value for clarity and simplicity for now.
+      expression.isTextBlock -> expression.replaceWith("\"\"\"${expression.value}\"\"\"")
+      expression.type?.equalsToText("java.lang.String") == true -> {
+        // `$` need to be escaped if followed by a legal Kotlin identifier
+        // https://kotlinlang.org/docs/reference/grammar.html#Identifier
+        val escapeDollar = Regex("\\\$(?=[a-z_]|`[^\\r\\n`]+`)")
+        expression.replaceWith(literalText.replace(escapeDollar, Regex.escapeReplacement("\\\$")))
+      }
+      else -> super.visitLiteralExpression(expression)
     }
   }
 
