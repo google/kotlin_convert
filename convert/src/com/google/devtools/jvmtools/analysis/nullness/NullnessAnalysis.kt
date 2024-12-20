@@ -79,8 +79,7 @@ import org.jetbrains.uast.visitor.UastTypedVisitor
 
 /** [Nullness] dataflow [UAnalysis] that aims to imitate Kotlin's nullness type system. */
 object NullnessAnalysis {
-  @Suppress("Immutable") // PSI & UAST can't be annotated
-  internal val BOTTOM = State<Nullness>(Tuple(), Tuple())
+  internal val BOTTOM = State.empty<Nullness>()
 
   fun UFile.nullness(): InterproceduralResult<CfgRoot, State<Nullness>> {
     val result =
@@ -163,8 +162,7 @@ object NullnessAnalysis {
       // In Java, captured variables are effectively final; otherwise, exclude non-final variables
       seen.removeIf { !it.hasModifierProperty(PsiModifier.FINAL) }
     }
-    @Suppress("Immutable") // PSI & UAST can't be annotated
-    if (seen.isEmpty()) return State(Tuple(), Tuple(storeContents)) // no captured variables
+    if (seen.isEmpty()) return State.withStore(storeContents) // no captured variables
 
     // Node to query analysis results at, which is the enclosing object literal or lambda
     var query: UExpression? =
@@ -188,8 +186,7 @@ object NullnessAnalysis {
         query = queryRoot
       }
     }
-    @Suppress("Immutable") // PSI & UAST can't be annotated
-    return State(Tuple(), Tuple(storeContents))
+    return State.withStore(storeContents)
   }
 
   private fun referencedVariables(root: CfgRoot): MutableSet<PsiVariable> {

@@ -28,7 +28,7 @@ import org.jetbrains.uast.UExpression
  */
 @Immutable
 data class Tuple<@ImmutableTypeParameter K : Any, V : Value<V>>(
-  private val contents: ImmutableMap<K, V> = ImmutableMap.of()
+  private val contents: ImmutableMap<K, V>
 ) : Value<Tuple<K, V>>, Map<K, V> by contents {
   constructor(values: Map<K, V>) : this(ImmutableMap.copyOf(values))
 
@@ -66,6 +66,14 @@ data class Tuple<@ImmutableTypeParameter K : Any, V : Value<V>>(
     for ((key, value) in newMappings) newContents[key] = value
     return Tuple(newContents)
   }
+
+  companion object {
+    private val EMPTY = Tuple<Nothing, Nothing>(ImmutableMap.of())
+
+    /** Returns an empty [Tuple], i.e., a [bottom][Tuple.isBottom] object. */
+    @Suppress("UNCHECKED_CAST")
+    fun <K : Any, V : Value<V>> empty(): Tuple<K, V> = EMPTY as Tuple<K, V>
+  }
 }
 
 /**
@@ -83,4 +91,15 @@ data class State<T : Value<T>>(val value: Tuple<UExpression, T>, val store: Tupl
 
   override fun implies(other: State<T>): Boolean =
     value.implies(other.value) && store.implies(other.store)
+
+  companion object {
+    private val EMPTY = State<Nothing>(Tuple.empty(), Tuple.empty())
+
+    /** Returns an empty [State], i.e., containing empty tuples. */
+    @Suppress("UNCHECKED_CAST") fun <T : Value<T>> empty(): State<T> = EMPTY as State<T>
+
+    /** Returns a [State] with the given [storeContents] and an empty [value] tuple. */
+    fun <T : Value<T>> withStore(storeContents: Map<PsiVariable, T>): State<T> =
+      State(Tuple.empty(), @Suppress("Immutable") Tuple(storeContents))
+  }
 }
