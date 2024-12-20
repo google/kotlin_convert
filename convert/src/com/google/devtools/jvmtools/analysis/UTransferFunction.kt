@@ -25,6 +25,12 @@ import org.jetbrains.uast.UElement
 import org.jetbrains.uast.UExpression
 import org.jetbrains.uast.UMethod
 
+/** Result of a dataflow [analysis][analyze]. */
+interface UDataflowResult<T> : UAnalysis<T> {
+  /** Final analysis result at the exit node. */
+  val finalResult: T
+}
+
 /** Context for [UTransferFunction] implementations to query analysis results. */
 // Identical to UAnalysis, but can add additional query functions here
 interface UDataflowContext<T : Value<T>> : UAnalysis<T>
@@ -45,7 +51,7 @@ typealias TransferFactory<T> = (UDataflowContext<T>) -> UTransferFunction<T>
 fun <T : Value<T>> UMethod.analyze(
   initialState: T,
   transferFactory: TransferFactory<T>,
-): UAnalysis<T> =
+): UDataflowResult<T> =
   DataflowAnalysis(Cfg.create(this), transferFactory).also { it.runAnalysis(initialState) }
 
 /**
@@ -58,7 +64,7 @@ fun <T : Value<T>> UMethod.analyze(
 fun <T : Value<T>> CfgRoot.analyze(
   initialState: T,
   transferFactory: TransferFactory<T>,
-): UAnalysis<T> =
+): UDataflowResult<T> =
   DataflowAnalysis(Cfg.create(this), transferFactory).also { it.runAnalysis(initialState) }
 
 /**
@@ -307,7 +313,7 @@ fun <T : Value<T>> TransferInput<T>.passthroughResult(node: UExpression): Transf
  * @param T abstract values being tracked
  */
 internal class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: TransferFactory<T>) :
-  UDataflowContext<T> {
+  UDataflowContext<T>, UDataflowResult<T> {
   private val before = mutableMapOf<UElement, TransferInput<T>>()
   private val after = mutableMapOf<UElement, TransferResult<T>>()
 
@@ -316,6 +322,9 @@ internal class DataflowAnalysis<T : Value<T>>(cfg: Cfg, transferFactory: Transfe
   // A better solution would be nice, but in practice this usually works.
   private val transfer: UTransferFunction<T> = transferFactory(this)
   val cfg: Cfg = if (transfer.isBackwards) cfg.reverse() else cfg
+
+  override val finalResult: T
+    get() = get(cfg.exitNode)
 
   fun runAnalysis(initialState: T) {
     val pending = mutableSetOf<UElement>()

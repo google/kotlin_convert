@@ -27,6 +27,7 @@ import com.google.devtools.jvmtools.analysis.TransferInput
 import com.google.devtools.jvmtools.analysis.TransferResult
 import com.google.devtools.jvmtools.analysis.Tuple
 import com.google.devtools.jvmtools.analysis.UAnalysis
+import com.google.devtools.jvmtools.analysis.UDataflowResult
 import com.google.devtools.jvmtools.analysis.UInterproceduralAnalysisContext
 import com.google.devtools.jvmtools.analysis.UTransferFunction
 import com.intellij.lang.java.JavaLanguage
@@ -86,7 +87,7 @@ object NullnessAnalysis {
       InterproceduralAnalysisBuilder<CfgRoot, State<Nullness>>(BOTTOM) { ctx ->
         NullnessTransfer(
           root = ctx.analysisKey.callee.rootNode,
-          analyzeLambda = { ctx.dataflowResult(CfgRoot.of(it))[it] },
+          analyzeLambda = { ctx.dataflowResult(CfgRoot.of(it)).finalResult },
         )
       }
     accept(
@@ -113,7 +114,7 @@ object NullnessAnalysis {
 
   private fun UInterproceduralAnalysisContext<CfgRoot, State<Nullness>>.dataflowResult(
     root: CfgRoot
-  ): UAnalysis<State<Nullness>> = dataflowResult(root, initialState(root))
+  ): UDataflowResult<State<Nullness>> = dataflowResult(root, initialState(root))
 
   /**
    * Returns the initial [State.store] to use for the given analysis [root], which includes:
@@ -151,7 +152,7 @@ object NullnessAnalysis {
         root.rootNode.refineFromArguments(
           storeContents,
           analysis = { dataflowResult(enclosing)[it] },
-          analyzeLambda = { dataflowResult(CfgRoot.of(it))[it] },
+          analyzeLambda = { dataflowResult(CfgRoot.of(it)).finalResult },
         )
       }
     }

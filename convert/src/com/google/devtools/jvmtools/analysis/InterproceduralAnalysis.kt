@@ -39,7 +39,7 @@ abstract class UInterproceduralAnalysisContext<K : CfgRootKey, V : Value<V>>(
    * Calling this method with the same [calleeKey] but different [initialState] will return results
    * computed using the join of all [initialState] values presented with the same [calleeKey].
    */
-  abstract fun dataflowResult(calleeKey: K, initialState: V): UAnalysis<V>
+  abstract fun dataflowResult(calleeKey: K, initialState: V): UDataflowResult<V>
 
   override fun toString(): String = "UInterproceduralAnalysisContext[$analysisKey]"
 }
@@ -52,8 +52,8 @@ abstract class UInterproceduralAnalysisContext<K : CfgRootKey, V : Value<V>>(
  */
 class InterproceduralResult<K : CfgRootKey, V>
 internal constructor(
-  private val results: Map<K, UAnalysis<V>>,
-  private val defaultResult: UAnalysis<V>,
+  private val results: Map<K, UDataflowResult<V>>,
+  private val defaultResult: UDataflowResult<V>,
 ) {
   /** Groups known analysis keys by their roots to allow querying all results for a given root. */
   val analysisKeys: ImmutableMultimap<CfgRoot, K> by lazy {
@@ -61,7 +61,8 @@ internal constructor(
   }
 
   /** Returns analysis results for the given key or a dummy result if the key is unknown. */
-  operator fun get(analysisKey: K): UAnalysis<V> = results.getOrDefault(analysisKey, defaultResult)
+  operator fun get(analysisKey: K): UDataflowResult<V> =
+    results.getOrDefault(analysisKey, defaultResult)
 }
 
 /**
@@ -115,7 +116,7 @@ class InterproceduralAnalysisBuilder<K : CfgRootKey, V : Value<V>>(
     }
   }
 
-  private fun getOrCompute(analysisKey: K, initialState: V): UAnalysis<V> {
+  private fun getOrCompute(analysisKey: K, initialState: V): UDataflowResult<V> {
     var summary = results[analysisKey]
     if (summary != null) {
       if (initialState.implies(summary.before)) {
@@ -131,7 +132,7 @@ class InterproceduralAnalysisBuilder<K : CfgRootKey, V : Value<V>>(
     return analyze(analysisKey, summary)
   }
 
-  private fun analyze(analysisKey: K, summary: DataflowSummary<V>): UAnalysis<V> {
+  private fun analyze(analysisKey: K, summary: DataflowSummary<V>): UDataflowResult<V> {
     if (!analyzing.add(analysisKey)) return dummyResult
 
     val analysis =
@@ -142,17 +143,17 @@ class InterproceduralAnalysisBuilder<K : CfgRootKey, V : Value<V>>(
     analyzing -= analysisKey
 
     summary.intraproceduralResults = analysis
-    val newResult = analysis[analysis.cfg.exitNode]
+    val newResult = analysis.finalResult
     if (!newResult.implies(summary.after)) {
       summary.after = summary.after join newResult
       worklist += callers[analysisKey]
     }
-    return analysis // not returning newResult so return value is stable
+    return analysis
   }
 
   private inner class ContextImpl(analysisKey: K) :
     UInterproceduralAnalysisContext<K, V>(analysisKey) {
-    override fun dataflowResult(calleeKey: K, initialState: V): UAnalysis<V> {
+    override fun dataflowResult(calleeKey: K, initialState: V): UDataflowResult<V> {
       val result = getOrCompute(calleeKey, initialState)
       // Register context as a "caller" of calleeContext
       callers.put(calleeKey, analysisKey)
@@ -164,12 +165,15 @@ class InterproceduralAnalysisBuilder<K : CfgRootKey, V : Value<V>>(
 private data class DataflowSummary<V>(
   var before: V,
   var after: V,
-  var intraproceduralResults: UAnalysis<V>,
+  var intraproceduralResults: UDataflowResult<V>,
 )
 
 /** Dummy [UAnalysis] that always returns [bottom]. */
 @Immutable
-private class BottomAnalysis<V : Value<V>>(val bottom: V) : UAnalysis<V> {
+private class BottomAnalysis<V : Value<V>>(val bottom: V) : UDataflowResult<V> {
+  override val finalResult: V
+    get() = bottom
+
   override fun get(node: UElement): V = bottom
 
   override fun get(element: PsiElement): V = bottom
