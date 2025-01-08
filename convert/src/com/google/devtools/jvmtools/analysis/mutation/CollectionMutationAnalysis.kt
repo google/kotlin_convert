@@ -36,15 +36,19 @@ import com.intellij.psi.PsiTypes
 import com.intellij.psi.PsiVariable
 import com.intellij.psi.util.InheritanceUtil
 import org.jetbrains.uast.UBinaryExpression
+import org.jetbrains.uast.UBinaryExpressionWithType
 import org.jetbrains.uast.UCallExpression
 import org.jetbrains.uast.UExpression
 import org.jetbrains.uast.UFile
+import org.jetbrains.uast.UIfExpression
 import org.jetbrains.uast.ULambdaExpression
 import org.jetbrains.uast.UMethod
+import org.jetbrains.uast.UParenthesizedExpression
 import org.jetbrains.uast.UQualifiedReferenceExpression
 import org.jetbrains.uast.UReturnExpression
 import org.jetbrains.uast.USimpleNameReferenceExpression
 import org.jetbrains.uast.UVariable
+import org.jetbrains.uast.UastBinaryExpressionWithTypeKind
 import org.jetbrains.uast.UastBinaryOperator
 import org.jetbrains.uast.getParameterForArgument
 import org.jetbrains.uast.toUElementOfType
@@ -228,18 +232,48 @@ private class CollectionMutationTransfer(
     )
   }
 
+  override fun visitIfExpression(
+    node: UIfExpression,
+    data: TransferInput<State<Mutation>>,
+  ): TransferResult<State<Mutation>> =
+    if (node.isTernary) {
+      val input = data.value()
+      val value = input.value.getOrUnused(node)
+      TransferResult.normal(
+        State(
+          input.value + listOfNotNull(node.thenExpression, node.elseExpression).map { it to value },
+          input.store,
+        )
+      )
+    } else {
+      super.visitIfExpression(node, data)
+    }
+
   override fun visitQualifiedReferenceExpression(
     node: UQualifiedReferenceExpression,
     data: TransferInput<State<Mutation>>,
-  ): TransferResult<State<Mutation>> {
-    val input = data.value()
+  ): TransferResult<State<Mutation>> =
     // Propagate to selector--this helps dealing with method calls being modeled as qualified
     // ref expressions. It's at first glance a bit odd for field references, but in the current
     // analysis that just ends up merging all accesses to the same field regardless of access path,
     // which is fine considering we just want to see if there's any mutating accesses that would
     // make the field mutable.
-    return TransferResult.normal(input.withValue(node.selector, input.value.getOrUnused(node)))
-  }
+    propagateToSubexpr(node, node.selector, data)
+
+  override fun visitParenthesizedExpression(
+    node: UParenthesizedExpression,
+    data: TransferInput<State<Mutation>>,
+  ): TransferResult<State<Mutation>> = propagateToSubexpr(node, node.expression, data)
+
+  override fun visitBinaryExpressionWithType(
+    node: UBinaryExpressionWithType,
+    data: TransferInput<State<Mutation>>,
+  ): TransferResult<State<Mutation>> =
+    if (node.operationKind is UastBinaryExpressionWithTypeKind.TypeCast) {
+      propagateToSubexpr(node, node.operand, data)
+    } else {
+      super.visitBinaryExpressionWithType(node, data)
+    }
 
   override fun visitCallExpression(
     node: UCallExpression,
@@ -295,6 +329,15 @@ private class CollectionMutationTransfer(
         input.store,
       )
     )
+  }
+
+  private fun propagateToSubexpr(
+    node: UExpression,
+    subexpr: UExpression,
+    data: TransferInput<State<Mutation>>,
+  ): TransferResult<State<Mutation>> {
+    val input = data.value()
+    return TransferResult.normal(input.withValue(subexpr, input.value.getOrUnused(node)))
   }
 
   private fun State<Mutation>.withValue(key: UExpression?, newValue: Mutation): State<Mutation> =
