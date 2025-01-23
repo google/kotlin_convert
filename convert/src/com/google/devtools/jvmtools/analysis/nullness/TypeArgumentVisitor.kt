@@ -47,6 +47,7 @@ import org.jetbrains.uast.UExpressionList
 import org.jetbrains.uast.UIfExpression
 import org.jetbrains.uast.ULabeledExpression
 import org.jetbrains.uast.ULambdaExpression
+import org.jetbrains.uast.UMethod
 import org.jetbrains.uast.UParenthesizedExpression
 import org.jetbrains.uast.UQualifiedReferenceExpression
 import org.jetbrains.uast.UReturnExpression
@@ -54,6 +55,20 @@ import org.jetbrains.uast.UastCallKind
 import org.jetbrains.uast.getParameterForArgument
 import org.jetbrains.uast.visitor.AbstractUastVisitor
 import org.jetbrains.uast.visitor.UastTypedVisitor
+
+/**
+ * Returns nullness of the receiver method's return value based on the given [analysis] state.
+ *
+ * @param analyzeLambda closure to get analysis results for lambda expressions if needed
+ */
+fun UMethod.returnValueNullness(
+  analysis: State<Nullness>,
+  analyzeLambda: (ULambdaExpression) -> State<Nullness>,
+): Nullness? =
+  TypeArgumentVisitor.returnValueNullness(
+    TypeArgumentVisitor(this, analysis, analyzeLambda),
+    selector = listOf(),
+  )
 
 /**
  * Returns nullness of the given expression, which is recursively inferred from [analysis] results
@@ -288,7 +303,7 @@ private fun <T> List<T>.subList(fromIndex: Int): List<T> = subList(fromIndex, si
  * target/needed type into account.
  */
 private class TypeArgumentVisitor(
-  private val startNode: UExpression,
+  private val startNode: UElement,
   private val analysis: State<Nullness>,
   private val analyzeLambda: (ULambdaExpression) -> State<Nullness>,
 ) : UastTypedVisitor<TypeComponentSelector, Nullness?> {
@@ -429,7 +444,7 @@ private class TypeArgumentVisitor(
     val visitor by lazy { TypeArgumentVisitor(node, analyzeLambda(node), analyzeLambda) }
     implemented?.returnType?.visitTypeComponents { component, selector ->
       if ((component as? PsiClassType)?.resolve()?.isEquivalentTo(needed) == true) {
-        returnValueNullness(node, selector + data.subList(1), visitor)?.let { constraints += it }
+        returnValueNullness(visitor, selector + data.subList(1))?.let { constraints += it }
       }
     }
 
@@ -479,19 +494,22 @@ private class TypeArgumentVisitor(
       super.visitQualifiedReferenceExpression(node, data)
     }
 
-  private companion object {
+  companion object {
     val ARRAY_COMPONENT_SELECTOR: TypeComponentSelector = listOf(null)
 
     /**
-     * Computes join of `return` expressions in the given analysis root (method or lambda body).
-     * This isn't perfect should a return expression be "overridden" in a finally block but in most
-     * cases good enough.
+     * Computes [join] of `return` expressions in [visitor]'s root (which should be a method or
+     * lambda body). This isn't perfect should a return expression be "overridden" in a finally
+     * block but in most cases good enough.
      */
-    private fun returnValueNullness(
-      root: UElement,
-      selector: TypeComponentSelector,
+    fun returnValueNullness(
       visitor: TypeArgumentVisitor,
+      selector: TypeComponentSelector,
     ): Nullness? {
+      val root = visitor.startNode
+      require(root is UMethod || root is ULambdaExpression) {
+        "Expected visitor for analysis root but got $root"
+      }
       var result: Nullness? = null
       root.accept(
         object : AbstractUastVisitor() {

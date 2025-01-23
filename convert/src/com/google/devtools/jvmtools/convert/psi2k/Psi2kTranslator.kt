@@ -30,6 +30,7 @@ import com.google.devtools.jvmtools.analysis.nullness.indicatesNullable
 import com.google.devtools.jvmtools.analysis.nullness.isInNullMarkedScope
 import com.google.devtools.jvmtools.analysis.nullness.isNonNullAnno
 import com.google.devtools.jvmtools.analysis.nullness.isNullableAnno
+import com.google.devtools.jvmtools.analysis.nullness.returnValueNullness
 import com.intellij.lang.java.JavaLanguage
 import com.intellij.psi.JavaElementVisitor
 import com.intellij.psi.JavaRecursiveElementVisitor
@@ -128,6 +129,7 @@ import org.jetbrains.kotlin.lexer.KtKeywordToken
 import org.jetbrains.kotlin.lexer.KtTokens
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfType
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfTypes2
+import org.jetbrains.uast.UElement
 import org.jetbrains.uast.UExpression
 import org.jetbrains.uast.UFile
 import org.jetbrains.uast.ULambdaExpression
@@ -1946,7 +1948,8 @@ private open class Psi2kTranslator(
           // carry type annotations, but the parent's type's component type does.
           ((node.parent as? PsiTypeElement)?.type as? PsiArrayType)?.deepComponentType
         ) ||
-        inferredNullable(node.parent as? PsiVariable)
+        inferredNullable(node.parent as? PsiVariable) ||
+        inferredNullableReturn(node.parent as? PsiMethod)
     ) {
       data.append("?")
     } else if (
@@ -2011,6 +2014,20 @@ private open class Psi2kTranslator(
       }
     )
     return result
+  }
+
+  private fun inferredNullableReturn(method: PsiMethod?): Boolean {
+    // Nullness analysis goes by annotations only for non-private methods, so for consistency don't
+    // change non-private method return types based on analysis results.
+    // TODO(b/384955376): use inferred return nullness for non-private methods
+    if (method?.isPrivate != true) return false
+    val uMethod = method.toUElementOfType<UMethod>() ?: return false
+    val nullness = nullness(CfgRoot.of(uMethod))
+    val value =
+      uMethod.returnValueNullness(nullness[uMethod as UElement]) { nullness(CfgRoot.of(it))[it] }
+        ?: Nullness.BOTTOM
+    return Nullness.NULL.implies(value) ||
+      (value == Nullness.PARAMETRIC && method.returnType?.hasNullableBound() != true)
   }
 
   override fun visitTypeParameter(classParameter: PsiTypeParameter) {

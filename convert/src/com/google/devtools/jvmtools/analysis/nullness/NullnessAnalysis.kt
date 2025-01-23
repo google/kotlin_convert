@@ -40,6 +40,7 @@ import com.intellij.psi.PsiModifier
 import com.intellij.psi.PsiModifierListOwner
 import com.intellij.psi.PsiParameter
 import com.intellij.psi.PsiType
+import com.intellij.psi.PsiTypeParameter
 import com.intellij.psi.PsiTypes
 import com.intellij.psi.PsiVariable
 import com.intellij.psi.util.PsiUtil.extractIterableTypeParameter
@@ -75,6 +76,7 @@ import org.jetbrains.uast.UastCallKind
 import org.jetbrains.uast.UastPrefixOperator
 import org.jetbrains.uast.getParentOfType
 import org.jetbrains.uast.internal.acceptList
+import org.jetbrains.uast.resolveToUElementOfType
 import org.jetbrains.uast.visitor.AbstractUastVisitor
 import org.jetbrains.uast.visitor.UastTypedVisitor
 
@@ -85,9 +87,44 @@ object NullnessAnalysis {
   fun UFile.nullness(): InterproceduralResult<CfgRoot, State<Nullness>> {
     val result =
       InterproceduralAnalysisBuilder<CfgRoot, State<Nullness>>(BOTTOM) { ctx ->
+        fun analyzeLambda(lambda: ULambdaExpression): State<Nullness> =
+          ctx.dataflowResult(CfgRoot.of(lambda)).finalResult
+
         NullnessTransfer(
           root = ctx.analysisKey.callee.rootNode,
-          analyzeLambda = { ctx.dataflowResult(CfgRoot.of(it)).finalResult },
+          analyzeLambda = ::analyzeLambda,
+          analyzeCallee = callee@{ call, state ->
+              val callee = call.resolveToUElementOfType<UMethod>() ?: return@callee null
+              // Trust annotations for non-private methods for now, since we can't fully analyze
+              // their call graphs.
+              if (!callee.hasModifierProperty(PsiModifier.PRIVATE)) return@callee null
+
+              // Methods with type parameters are complicated because they might be parametric,
+              // so skip those for now as well.
+              // TODO(b/384955376): include methods with type parameters in interprocedural analysis
+              if (callee.hasTypeParameters()) return@callee null
+
+              val storeContents = mutableMapOf<PsiVariable, Nullness>()
+              callee.parameterList.parameters.forEachIndexed { index, param ->
+                if ((param.type as? PsiClassType)?.resolve() is PsiTypeParameter) return@callee null
+                // Always honor callee annotations but join with what we know about arguments
+                storeContents[param] =
+                  nullnessFromAnnotation(param.type, param) join
+                    (state.value[call.getArgumentForParameter(index)] ?: Nullness.BOTTOM)
+              }
+
+              val root = CfgRoot.of(callee)
+              val dataflowResult =
+                ctx.dataflowResult(root, ctx.capturedState(root, storeContents)).finalResult
+
+              callee
+                .returnValueNullness(dataflowResult, ::analyzeLambda)
+                .takeIf { it != Nullness.PARAMETRIC }
+                ?.let {
+                  // If we get a result, join it with callee annotation
+                  it join nullnessFromAnnotation(callee.returnType, callee)
+                }
+            },
         )
       }
     accept(
@@ -157,6 +194,13 @@ object NullnessAnalysis {
       }
     }
 
+    return capturedState(root, storeContents)
+  }
+
+  private fun UInterproceduralAnalysisContext<CfgRoot, State<Nullness>>.capturedState(
+    root: CfgRoot,
+    storeContents: MutableMap<PsiVariable, Nullness>,
+  ): State<Nullness> {
     val seen = referencedVariables(root)
     seen.removeAll(storeContents.keys)
     if (root.rootNode.lang != JavaLanguage.INSTANCE) {
@@ -241,6 +285,7 @@ object NullnessAnalysis {
 private class NullnessTransfer(
   private val root: UElement,
   private val analyzeLambda: (ULambdaExpression) -> State<Nullness>,
+  private val analyzeCallee: (UCallExpression, State<Nullness>) -> Nullness?,
 ) : UTransferFunction<State<Nullness>> {
   override val bottom: State<Nullness>
     get() = NullnessAnalysis.BOTTOM
@@ -512,7 +557,8 @@ private class NullnessTransfer(
 
     val state = data.value()
     val value =
-      node.resultNullness(state, analyzeLambda)
+      analyzeCallee(node, state)
+        ?: node.resultNullness(state, analyzeLambda)
         ?: nullnessFromAnnotation(node.getExpressionType(), node.resolve())
     // TODO(b/308816245): havoc fields once we track them
     return state.toNormalResult(node, value, dereference = node.receiver)
