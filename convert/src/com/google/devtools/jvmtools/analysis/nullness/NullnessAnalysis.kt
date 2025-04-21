@@ -26,7 +26,6 @@ import com.google.devtools.jvmtools.analysis.State
 import com.google.devtools.jvmtools.analysis.TransferInput
 import com.google.devtools.jvmtools.analysis.TransferResult
 import com.google.devtools.jvmtools.analysis.Tuple
-import com.google.devtools.jvmtools.analysis.UAnalysis
 import com.google.devtools.jvmtools.analysis.UDataflowResult
 import com.google.devtools.jvmtools.analysis.UInterproceduralAnalysisContext
 import com.google.devtools.jvmtools.analysis.UTransferFunction
@@ -80,7 +79,7 @@ import org.jetbrains.uast.resolveToUElementOfType
 import org.jetbrains.uast.visitor.AbstractUastVisitor
 import org.jetbrains.uast.visitor.UastTypedVisitor
 
-/** [Nullness] dataflow [UAnalysis] that aims to imitate Kotlin's nullness type system. */
+/** [Nullness] dataflow analysis that aims to imitate Kotlin's nullness type system. */
 object NullnessAnalysis {
   internal val BOTTOM = State.empty<Nullness>()
 
@@ -283,8 +282,14 @@ object NullnessAnalysis {
 
 /** Transfer function for tracking reference [Nullness] similar to how Kotlin would. */
 private class NullnessTransfer(
+  /** The root node of what's being analyzed, i.e., a [CfgRoot.rootNode]. */
   private val root: UElement,
+  /** Produces interprocedural analysis result of the given lambda as needed by [resultNullness]. */
   private val analyzeLambda: (ULambdaExpression) -> State<Nullness>,
+  /**
+   * Analysis function that given a call site and current analysis state returns the callee's return
+   * value [Nullness] or `null` if interprocedural analysis is not supported for this call.
+   */
   private val analyzeCallee: (UCallExpression, State<Nullness>) -> Nullness?,
 ) : UTransferFunction<State<Nullness>> {
   override val bottom: State<Nullness>
