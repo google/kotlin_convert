@@ -229,6 +229,7 @@ private fun PsiType.componentNullness(
       }
 
       override fun visitWildcardType(wildcardType: PsiWildcardType): Nullness? {
+        if (fromIndex == 0) return null
         val wildcardedParam = selector[fromIndex - 1]
         val implicitBounds =
           wildcardedParam?.extendsList?.referencedTypes ?: PsiClassType.EMPTY_ARRAY
