@@ -22,6 +22,7 @@ import com.google.devtools.jvmtools.analysis.join
 import com.intellij.psi.JavaPsiFacade
 import com.intellij.psi.LambdaUtil
 import com.intellij.psi.PsiArrayType
+import com.intellij.psi.PsiCapturedWildcardType
 import com.intellij.psi.PsiClass
 import com.intellij.psi.PsiClassType
 import com.intellij.psi.PsiDisjunctionType
@@ -228,9 +229,16 @@ private fun PsiType.componentNullness(
         return selectedType?.componentNullness(selector, decl, fromIndex + 1, parametricNullness)
       }
 
-      override fun visitWildcardType(wildcardType: PsiWildcardType): Nullness? {
-        if (fromIndex == 0) return null
-        val wildcardedParam = selector[fromIndex - 1]
+      override fun visitCapturedWildcardType(capturedWildcardType: PsiCapturedWildcardType) =
+        visitWildcard(capturedWildcardType.wildcard, capturedWildcardType.typeParameter)
+
+      override fun visitWildcardType(wildcardType: PsiWildcardType) = visitWildcard(wildcardType)
+
+      private fun visitWildcard(
+        wildcardType: PsiWildcardType,
+        wildcardedParam: PsiTypeParameter? = null, // null to get from selector
+      ): Nullness? {
+        val wildcardedParam = wildcardedParam ?: selector.getOrNull(fromIndex - 1)
         val implicitBounds =
           wildcardedParam?.extendsList?.referencedTypes ?: PsiClassType.EMPTY_ARRAY
         // If there are implicit bounds, collect their constraints, otherwise ignore since the

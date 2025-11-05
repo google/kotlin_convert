@@ -88,11 +88,7 @@ internal fun nullnessFromAnnotation(
     indicatesNonNull(declaration?.modifierList, useTypeAnnos = false) || indicatesNonNull(type) ->
       Nullness.NONULL
     type?.hasNullableBound() == true && typeParameter?.hasNullableBound() != false ->
-      if (
-        (type is PsiClassType && type.resolve() is PsiTypeParameter) ||
-          type is PsiWildcardType ||
-          type is PsiCapturedWildcardType
-      ) {
+      if ((type is PsiClassType && type.resolve() is PsiTypeParameter) || type is PsiWildcardType) {
         Nullness.PARAMETRIC
       } else {
         Nullness.NULLABLE
