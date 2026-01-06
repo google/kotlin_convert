@@ -249,7 +249,7 @@ object CollectionMutationAnalysis {
 
             // Because overload resolution is complicated and error-prone, we over-approximate here
             // by seeing if any overload uses MutableXxx types in the requested position.
-            // TODO(kmb): Find a way to get the correct KaCallableSymbol, ideally also from source
+            // TODO: KT-83483 - Find a way to get correct KaCallableSymbol, ideally also from source
             candidates
               .mapNotNull {
                 when {
