@@ -16,6 +16,8 @@
 
 package com.google.devtools.jvmtools.analysis.mutation
 
+import com.android.tools.lint.detector.api.isKotlin
+import com.google.devtools.jvmtools.convert.util.runIf
 import com.google.devtools.jvmtools.analysis.CfgRoot
 import com.google.devtools.jvmtools.analysis.CfgRootKey
 import com.google.devtools.jvmtools.analysis.InterproceduralAnalysisBuilder
@@ -32,12 +34,25 @@ import com.google.errorprone.annotations.Immutable
 import com.intellij.psi.LambdaUtil.getFunctionalInterfaceMethod
 import com.intellij.psi.PsiMethod
 import com.intellij.psi.PsiModifierListOwner
+import com.intellij.psi.PsiParameter
 import com.intellij.psi.PsiTypes
 import com.intellij.psi.PsiVariable
 import com.intellij.psi.util.InheritanceUtil
+import com.intellij.psi.util.PsiUtil.getPackageName
+import org.jetbrains.kotlin.analysis.api.KaExperimentalApi
+import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.projectStructure.KaModuleProvider
+import org.jetbrains.kotlin.analysis.api.symbols.KaFunctionSymbol
+import org.jetbrains.kotlin.analysis.api.types.KaType
+import org.jetbrains.kotlin.light.classes.symbol.annotations.getJvmNameFromAnnotation
+import org.jetbrains.kotlin.name.ClassId
+import org.jetbrains.kotlin.name.FqName
+import org.jetbrains.kotlin.psi.KtCallableDeclaration
+import org.jetbrains.kotlin.psi.KtNamedFunction
 import org.jetbrains.uast.UBinaryExpression
 import org.jetbrains.uast.UBinaryExpressionWithType
 import org.jetbrains.uast.UCallExpression
+import org.jetbrains.uast.UElement
 import org.jetbrains.uast.UExpression
 import org.jetbrains.uast.UFile
 import org.jetbrains.uast.UIfExpression
@@ -51,6 +66,7 @@ import org.jetbrains.uast.UVariable
 import org.jetbrains.uast.UastBinaryExpressionWithTypeKind
 import org.jetbrains.uast.UastBinaryOperator
 import org.jetbrains.uast.getParameterForArgument
+import org.jetbrains.uast.toUElement
 import org.jetbrains.uast.toUElementOfType
 import org.jetbrains.uast.tryResolve
 import org.jetbrains.uast.visitor.AbstractUastVisitor
@@ -91,7 +107,11 @@ object CollectionMutationAnalysis {
           val callee = call.resolve() ?: return@mutations Tuple.empty()
           val declaredMutations: Tuple<PsiVariable, Mutation> =
             @Suppress("Immutable") // PSI can't be annotated
-            Tuple(callee.parameterList.parameters.associateWith { mutationFromAnnotation(it) })
+            Tuple(
+              callee.parameterList.parameters.associateWith {
+                call.mutationFromDeclaration(callee, it)
+              }
+            )
 
           // Limit scope of analysis to given file for now
           if (callee.containingFile != sourcePsi) return@mutations declaredMutations
@@ -146,16 +166,107 @@ object CollectionMutationAnalysis {
         is CfgRoot.Lambda -> getFunctionalInterfaceMethod(rootNode.functionalInterfaceType)
       }
 
-    return if (method?.returnType == PsiTypes.voidType()) {
-      Mutation.UNUSED
-    } else {
-      mutationFromAnnotation(method)
+    return when {
+      method == null -> Mutation.READ
+      method.returnType == PsiTypes.voidType() -> Mutation.UNUSED
+      else -> rootNode.mutationFromDeclaration(method, parameter = null)
     }
   }
 
-  // TODO(b/309967546): handle MutableXxx parameters / return types for methods defined in Kotlin
-  private fun mutationFromAnnotation(declaration: PsiModifierListOwner?): Mutation =
-    if (declaration?.hasMutableAnnotation() == true) Mutation.MODIFIED else Mutation.READ
+  /**
+   * Returns the declared mutation of given [parameter], or of the [method]'s return value if
+   * [parameter] is `null`.
+   */
+  @OptIn(KaExperimentalApi::class)
+  private fun UElement.mutationFromDeclaration(
+    method: PsiMethod,
+    parameter: PsiParameter?,
+  ): Mutation {
+    check(parameter == null || parameter.declarationScope == method) {
+      "expected parameter of $method but got $parameter"
+    }
+    val declaration = parameter ?: method
+    if (declaration.hasMutableAnnotation()) return Mutation.MODIFIED
+    if (
+      !isKotlin(declaration.language) &&
+        method.containingClass?.hasAnnotation("kotlin.Metadata") != true
+    ) {
+      // isKotlin only works for declarations in source, while @Metadata annotations mark Kotlin
+      // classes loaded from Jars
+      return Mutation.READ
+    }
+
+    // If declaration is Kotlin, use Analysis API to look for MutableXxx types. (Don't do this for
+    // Java declarations, where the API will use flexible types that include mutable collections.)
+    val isMutable =
+      sourcePsi?.let { useSite ->
+        analyze(KaModuleProvider.getInstance(useSite.project).getModule(useSite, null)) {
+          // Local declaration because it needs KaSession in scope
+          fun KaType.isMutableCollectionType() =
+            isSubtypeOf(ClassId.fromString("kotlin/collections/MutableCollection")) ||
+              isSubtypeOf(ClassId.fromString("kotlin/collections/MutableIterator")) ||
+              isSubtypeOf(ClassId.fromString("kotlin/collections/MutableMap")) ||
+              isSubtypeOf(ClassId.fromString("kotlin/collections/MutableMap.MutableEntry"))
+
+          if (isKotlin(declaration.language)) {
+            // KaJavaInteroperabilityComponent doesn't appear to work for Kotlin declarations, but
+            // we can use Ka[Expression]TypeProvider from Kotlin PSI if we have sources. The logic
+            // for binary declarations below would probably also work, but this is more preceise.
+            val type =
+              (declaration.toUElement()?.sourcePsi as? KtCallableDeclaration)?.returnType
+                // sourcePsi is null for extension receivers, so look them up directly
+                ?: (method.toUElementOfType<UMethod>()?.sourcePsi as? KtNamedFunction)
+                  ?.receiverTypeReference
+                  ?.type
+            type?.isMutableCollectionType()
+          } else {
+            // We'll get here for Kotlin declarations loaded from Jars. Unfortunately,
+            // KaJavaInteroperabilityComponent's asKaType, callableSymbol, etc. utilities don't work
+            // for binary classes, so we approximate finding the method "manually" below.
+            val scope =
+              method.containingClass?.qualifiedName?.replace('.', '/')?.replace('$', '.')?.let {
+                findClass(ClassId.fromString(it))?.memberScope
+              }
+                ?: method.containingClass?.let { clazz ->
+                  // If we can't find the class it may be synthetic, so look for top-level functions
+                  findPackage(FqName(getPackageName(clazz) ?: ""))?.packageScope
+                }
+                ?: return@analyze null
+            val jvmParamIdx =
+              if (parameter != null) method.parameterList.getParameterIndex(parameter) else -1
+
+            val candidates =
+              if (method.isConstructor) {
+                scope.constructors
+              } else {
+                scope.callables // get all callables so we can filter by JVM name
+                  .filterIsInstance<KaFunctionSymbol>()
+                  .filter {
+                    method.name ==
+                      (it.getJvmNameFromAnnotation() ?: it.callableId?.callableName?.asString())
+                  }
+              }
+
+            // Because overload resolution is complicated and error-prone, we over-approximate here
+            // by seeing if any overload uses MutableXxx types in the requested position.
+            // TODO(kmb): Find a way to get the correct KaCallableSymbol, ideally also from source
+            candidates
+              .mapNotNull {
+                when {
+                  parameter == null -> it // use function return type
+                  // Extension receiver appears as first parameter so adjust for that
+                  jvmParamIdx == 0 && it.isExtension -> it.receiverParameter
+                  // Look up the referenced parameter, ignoring methods with too few parameters
+                  else -> it.valueParameters.getOrNull(jvmParamIdx - (if (it.isExtension) 1 else 0))
+                }
+              }
+              .any { it.returnType.isMutableCollectionType() }
+          }
+        }
+      }
+
+    return if (isMutable == true) Mutation.MODIFIED else Mutation.READ
+  }
 
   /** Returns true if there's a `@Mutable` annotation. */
   private fun PsiModifierListOwner.hasMutableAnnotation() =
@@ -313,7 +424,18 @@ private class CollectionMutationTransfer(
           "values" -> input.value.getOrUnused(node)
           else -> Mutation.READ
         }
-      return TransferResult.normal(input.withValue(node.receiver, mutation))
+      val result =
+        State(
+          input.value +
+            listOfNotNull(
+              node.receiver?.let { it to mutation },
+              runIf(callee?.name?.endsWith("All") == true) {
+                node.valueArguments.getOrNull(0)?.let { it to Mutation.READ }
+              },
+            ),
+          input.store,
+        )
+      return TransferResult.normal(result)
     }
 
     val value = input.value.getOrUnused(node)

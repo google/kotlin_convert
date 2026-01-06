@@ -30,7 +30,7 @@ import org.jetbrains.uast.UExpression
 data class Tuple<@ImmutableTypeParameter K : Any, V : Value<V>>(
   private val contents: ImmutableMap<K, V>
 ) : Value<Tuple<K, V>>, Map<K, V> by contents {
-  constructor(values: Map<K, V>) : this(ImmutableMap.copyOf(values))
+  constructor(values: Map<out K, V>) : this(ImmutableMap.copyOf(values))
 
   override val isBottom: Boolean
     get() = contents.values.all { it.isBottom } // trivially true if contents empty as desired
