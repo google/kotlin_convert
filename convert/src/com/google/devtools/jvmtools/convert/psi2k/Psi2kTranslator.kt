@@ -2079,29 +2079,29 @@ private open class Psi2kTranslator(
     val DELEGATION_KEYWORDS = setOf(PsiKeyword.THIS, PsiKeyword.SUPER)
     val PRIMITIVE_TYPES: Map<PsiType, String> =
       mapOf(
-        PsiType.BOOLEAN to "Boolean",
-        PsiType.BYTE to "Byte",
-        PsiType.CHAR to "Char",
-        PsiType.DOUBLE to "Double",
-        PsiType.FLOAT to "Float",
-        PsiType.INT to "Int",
-        PsiType.LONG to "Long",
-        PsiType.SHORT to "Short",
-        PsiType.VOID to "Unit",
-        PsiType.NULL to "Nothing?", // Java's "null type" is nullable bottom
+        PsiTypes.booleanType() to "Boolean",
+        PsiTypes.byteType() to "Byte",
+        PsiTypes.charType() to "Char",
+        PsiTypes.doubleType() to "Double",
+        PsiTypes.floatType() to "Float",
+        PsiTypes.intType() to "Int",
+        PsiTypes.longType() to "Long",
+        PsiTypes.shortType() to "Short",
+        PsiTypes.voidType() to "Unit",
+        PsiTypes.nullType() to "Nothing?", // Java's "null type" is nullable bottom
       )
     val PRIMITIVE_INITIALIZER: Map<PsiType, String> =
       mapOf(
-        PsiType.BOOLEAN to "false",
-        PsiType.BYTE to "0",
-        PsiType.CHAR to "'\\0'",
-        PsiType.DOUBLE to "0.0",
-        PsiType.FLOAT to "0.0f",
-        PsiType.INT to "0",
-        PsiType.LONG to "0L",
-        PsiType.SHORT to "0",
-        PsiType.VOID to "Unit",
-        PsiType.NULL to "null",
+        PsiTypes.booleanType() to "false",
+        PsiTypes.byteType() to "0",
+        PsiTypes.charType() to "'\\0'",
+        PsiTypes.doubleType() to "0.0",
+        PsiTypes.floatType() to "0.0f",
+        PsiTypes.intType() to "0",
+        PsiTypes.longType() to "0L",
+        PsiTypes.shortType() to "0",
+        PsiTypes.voidType() to "Unit",
+        PsiTypes.nullType() to "null",
       )
 
     val MAPPED_TYPES: Map<String, String> =
