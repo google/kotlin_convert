@@ -49,7 +49,7 @@ data class MappedMethod(
 
     private val MAPPED_METHODS =
       listOf(
-        // go/keep-sorted block=yes start
+        // go/keep-sorted start block=yes
         MappedMethod(
           "com.google.common.base.Strings",
           "isNullOrEmpty",
