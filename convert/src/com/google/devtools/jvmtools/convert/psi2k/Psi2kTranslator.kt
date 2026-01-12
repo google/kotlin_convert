@@ -916,7 +916,7 @@ private open class Psi2kTranslator(
     // https://kotlinlang.org/docs/numbers.html#literal-constants-for-numbers
     var literalText = expression.text
     when {
-      expression.type == PsiType.DOUBLE && literalText.endsWith("d", ignoreCase = true) -> {
+      expression.type == PsiTypes.doubleType() && literalText.endsWith("d", ignoreCase = true) -> {
         // There's no 0d suffix in Kotlin (b/282171141), so use .0 instead. We could alternatively
         // do this in visitJavaToken, somehow still making sure we're looking at a double literal.
         literalText = literalText.dropLast(1)
@@ -1030,7 +1030,7 @@ private open class Psi2kTranslator(
 
           if (child == node.parameterList) {
             // Minor beautification: don't print "Unit" return types
-            visitTypeDeclaration(node.returnTypeElement) { it.type != PsiType.VOID }
+            visitTypeDeclaration(node.returnTypeElement) { it.type != PsiTypes.voidType() }
 
             if (node.isConstructor) {
               // See if we have a constructor delegation to translate. If so translate it here and
