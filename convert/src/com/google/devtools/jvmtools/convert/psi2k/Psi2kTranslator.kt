@@ -1057,10 +1057,7 @@ private open class Psi2kTranslator(
   }
 
   override fun visitMethodCallExpression(expression: PsiMethodCallExpression) {
-    val mappedMethod =
-      expression.methodExpression.referenceName?.let { methodRef ->
-        MappedMethod.get(methodRef, expression.resolveMethod()?.containingClass)
-      }
+    val mappedMethod = MappedMethod.forCall(expression)
     if (mappedMethod == null) {
       super.visitMethodCallExpression(expression)
       return

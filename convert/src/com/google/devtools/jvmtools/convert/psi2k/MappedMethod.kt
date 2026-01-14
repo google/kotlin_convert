@@ -16,8 +16,15 @@
 
 package com.google.devtools.jvmtools.convert.psi2k
 
-import com.intellij.psi.PsiClass
+import com.android.tools.lint.detector.api.isKotlin
+import com.intellij.psi.PsiMethodCallExpression
 import com.intellij.psi.util.InheritanceUtil
+import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.projectStructure.KaModuleProvider
+import org.jetbrains.kotlin.analysis.api.symbols.KaPropertySymbol
+import org.jetbrains.kotlin.light.classes.symbol.annotations.getJvmNameFromAnnotation
+import org.jetbrains.kotlin.load.java.JvmAbi
+import org.jetbrains.kotlin.name.ClassId
 
 /** Type of method conversion. */
 enum class MappingType {
@@ -38,14 +45,50 @@ data class MappedMethod(
 ) {
 
   companion object {
-    /**
-     * Returns a [MappedMethod] that matches the given method & class, or `null` if it does not
-     * exist.
-     */
-    fun get(methodRef: String, containingClass: PsiClass?): MappedMethod? =
-      MAPPED_METHODS_BY_NAME.get(methodRef)?.firstOrNull { method ->
-        InheritanceUtil.isInheritor(containingClass, method.className)
+    /** Returns a [MappedMethod] that matches the given callee, or `null` if it does not exist. */
+    fun forCall(call: PsiMethodCallExpression): MappedMethod? {
+      val callee = call.resolveMethod() ?: return null
+      val declaringClass = callee.containingClass ?: return null
+      MAPPED_METHODS_BY_NAME[callee.name]?.firstOrNull { method ->
+          InheritanceUtil.isInheritor(declaringClass, method.className)
+        }
+        ?.let {
+          return it
+        }
+
+      // Map calls to Kotlin property getters, which is required in Kotlin (b/354260950).
+      // TODO: b/354260950 - handle extension properties, setters
+      if (!call.argumentList.isEmpty) return null
+      if (!isKotlin(callee.language) && !declaringClass.hasAnnotation("kotlin.Metadata")) {
+        return null // @kotlin.Metadata indicates Kotlin declaration in binary dependency
       }
+      return analyze(KaModuleProvider.getInstance(call.project).getModule(call, null)) {
+        // callee.callableSymbol doesn't work, so manually look for matching property (see KT-83483)
+        val klass =
+          findClass(
+            ClassId.fromString(
+              declaringClass.qualifiedName?.replace('.', '/')?.replace('$', '.')
+                ?: return@analyze null
+            )
+          )
+        val ktSymbol =
+          klass?.memberScope?.callables?.filterIsInstance<KaPropertySymbol>()?.firstOrNull {
+            val getterName =
+              it.getter?.getJvmNameFromAnnotation() ?: JvmAbi.getterName(it.name.identifier)
+            getterName == callee.name
+          }
+        if (ktSymbol != null) {
+          MappedMethod(
+            className = declaringClass.qualifiedName ?: "<anonymous>",
+            javaMethodName = callee.name,
+            kotlinName = ktSymbol.name.identifier,
+            type = MappingType.PROPERTY,
+          )
+        } else {
+          null
+        }
+      }
+    }
 
     private val MAPPED_METHODS =
       listOf(
