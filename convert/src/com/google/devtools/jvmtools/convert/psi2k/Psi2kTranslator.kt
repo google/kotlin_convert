@@ -106,7 +106,11 @@ import com.intellij.psi.PsiResourceVariable
 import com.intellij.psi.PsiReturnStatement
 import com.intellij.psi.PsiStatement
 import com.intellij.psi.PsiSuperExpression
+import com.intellij.psi.PsiSwitchBlock
+import com.intellij.psi.PsiSwitchExpression
 import com.intellij.psi.PsiSwitchLabelStatement
+import com.intellij.psi.PsiSwitchLabelStatementBase
+import com.intellij.psi.PsiSwitchLabeledRuleStatement
 import com.intellij.psi.PsiSwitchStatement
 import com.intellij.psi.PsiThisExpression
 import com.intellij.psi.PsiTryStatement
@@ -119,6 +123,7 @@ import com.intellij.psi.PsiUnaryExpression
 import com.intellij.psi.PsiVariable
 import com.intellij.psi.PsiWhiteSpace
 import com.intellij.psi.PsiWildcardType
+import com.intellij.psi.PsiYieldStatement
 import com.intellij.psi.util.TypeConversionUtil.calcTypeForBinaryExpression
 import com.intellij.psi.util.TypeConversionUtil.isIntegralNumberType
 import com.intellij.psi.util.TypeConversionUtil.isNumericType
@@ -562,6 +567,27 @@ private open class Psi2kTranslator(
     node.children().filter { it != label }.acceptEach { it.tokenOrNull() == ";" }
   }
 
+  override fun visitCaseLabelElementList(list: PsiCaseLabelElementList) {
+    seen(list)
+    // Qualify enum constants with class name in switch cases
+    list.children().replaceNotNull { token ->
+      if (token is PsiReferenceExpression) {
+        val enumClass = token.resolve()?.parent as? PsiClass ?: return@replaceNotNull null
+        if (!enumClass.isEnum) return@replaceNotNull null
+        val enumClassName = enumClass.getNameOfPossiblyInnerClass()
+        val enumClassQName = enumClass.qualifiedName ?: return@replaceNotNull null
+        val packageName = enumClassQName.removeSuffix(".$enumClassName")
+        if (token.containingFile.isPackageDefaultImported(packageName)) {
+          "${enumClassName}.${token.text}"
+        } else {
+          "${enumClassQName}.${token.text}"
+        }
+      } else {
+        null
+      }
+    }
+  }
+
   override fun visitCatchSection(section: PsiCatchSection) {
     val param = section.parameter
     val typeElement = param?.typeElement
@@ -876,6 +902,7 @@ private open class Psi2kTranslator(
       PsiKeyword.NEW -> seen(token) // `new` doesn't translate to Kotlin, so just skip it
       PsiKeyword.INSTANCEOF -> token.replaceWith("is") // x instanceof Foo ==> x is Foo
       PsiKeyword.SWITCH -> token.replaceWith("when")
+      PsiKeyword.YIELD -> token.replaceWith("return@switch") // see visitSwitchExpr
       else -> super.visitJavaToken(token)
     }
   }
@@ -1644,7 +1671,52 @@ private open class Psi2kTranslator(
     }
   }
 
+  override fun visitSwitchExpression(expression: PsiSwitchExpression) {
+    var containsYield = false
+    expression.accept(
+      object : JavaRecursiveElementWalkingVisitor() {
+        override fun visitYieldStatement(statement: PsiYieldStatement) {
+          containsYield = true
+          stopWalking()
+        }
+      }
+    )
+
+    // This lets us translate `yield` expr ==> return@switch expr in visitJavaToken
+    // Many yield's can probably just be omitted (e.g., at end of a case statement), but we don't
+    // try to identify those cases for simplicity for now. `switch` can't be an identifier in Java
+    // so should be safe to introduce as a label here.
+    if (containsYield) data.append(" run switch@{ ")
+    visitSwitchBlock(expression)
+    if (containsYield) data.append(" } ")
+  }
+
+  override fun visitSwitchLabelStatement(statement: PsiSwitchLabelStatement) {
+    visitSwitchLabel(statement)
+  }
+
+  override fun visitSwitchLabeledRuleStatement(statement: PsiSwitchLabeledRuleStatement) {
+    visitSwitchLabel(statement)
+  }
+
+  private fun visitSwitchLabel(statement: PsiSwitchLabelStatementBase) {
+    // case: ==> nothing, default: ==> else
+    seen(statement)
+    statement.children().replaceNotNull {
+      when (it.tokenOrNull()) {
+        PsiKeyword.CASE,
+        ":" -> ""
+        PsiKeyword.DEFAULT -> "else"
+        else -> null
+      }
+    }
+  }
+
   override fun visitSwitchStatement(statement: PsiSwitchStatement) {
+    visitSwitchBlock(statement)
+  }
+
+  private fun visitSwitchBlock(statement: PsiSwitchBlock) {
     // Roughly: [switch (<expr>) { case A: case B: <stmts> default: <more> }]
     // ==> when ([expr]) { A, B -> { [stmts] } else -> [more] }
     // where we also want to drop break statements as they're meaningless. Since there is no
@@ -1654,12 +1726,11 @@ private open class Psi2kTranslator(
       if (child is PsiCodeBlock) {
         seen(child)
         // Need UAST representation to use canFallthroughTo below
-        val uast = statement.toUElement(USwitchExpression::class.java)
+        val uast = statement.toUElementOfType<USwitchExpression>()
         var firstCase = true
         var needBlockClose = false
         child.children().forEach { blockElem ->
           if (blockElem is PsiSwitchLabelStatement) {
-            seen(blockElem)
             if (needBlockClose) {
               if (uast?.canFallthroughTo(blockElem) != false) {
                 // If fallthrough from previous code block is possible, translate subsequent code
@@ -1669,10 +1740,9 @@ private open class Psi2kTranslator(
                 // switch block.
                 with(Psi2kTranslator(data, seen = mutableMapOf(), nullness)) {
                   var lookahead: PsiElement? = blockElem.nextSibling
-                  var inFallthroughBlock = false // wait until first non-PsiSwithLabelStmt
+                  var inFallthroughBlock = false // wait until first non-PsiSwitchLabelStmt
                   while (lookahead != null && lookahead.tokenOrNull() != "}") {
-                    // Shortcut: definitely done, and we don't want to translate this, so
-                    // just stop
+                    // Shortcut: definitely done, and we don't want to translate this, so just stop
                     if (lookahead is PsiBreakStatement && lookahead.labelIdentifier == null) break
                     if (lookahead is PsiSwitchLabelStatement) {
                       // First switch label after code block: stop if we can't fall through
@@ -1693,38 +1763,7 @@ private open class Psi2kTranslator(
               needBlockClose = false
             }
             if (!firstCase) data.append(", ") else firstCase = false
-            for (blockChild in blockElem.children()) {
-              // Qualify enum constants with class name
-              if (blockChild is PsiCaseLabelElementList) {
-                seen(blockChild)
-                blockChild.children().replaceNotNull { token ->
-                  if (token is PsiReferenceExpression) {
-                    val enumClass =
-                      token.resolve()?.parent as? PsiClass ?: return@replaceNotNull null
-                    if (!enumClass.isEnum) return@replaceNotNull null
-                    val enumClassName = enumClass.getNameOfPossiblyInnerClass()
-                    val enumClassQName = enumClass.qualifiedName ?: return@replaceNotNull null
-                    val packageName = enumClassQName.removeSuffix(".$enumClassName")
-                    return@replaceNotNull if (
-                      token.containingFile.isPackageDefaultImported(packageName)
-                    ) {
-                      "${enumClassName}.${token.text}"
-                    } else {
-                      "${enumClassQName}.${token.text}"
-                    }
-                  } else {
-                    null
-                  }
-                }
-              } else {
-                when (blockChild.tokenOrNull()) {
-                  PsiKeyword.CASE,
-                  ":" -> blockChild.replaceWith("")
-                  PsiKeyword.DEFAULT -> blockChild.replaceWith("else")
-                  else -> doAccept(blockChild)
-                }
-              }
-            }
+            doAccept(blockElem) // effectively calls visitSwitchLabelStatement
           } else {
             if (!firstCase && blockElem !is PsiComment && blockElem !is PsiWhiteSpace) {
               firstCase = true
