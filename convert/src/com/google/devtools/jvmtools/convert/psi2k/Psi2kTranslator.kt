@@ -1548,7 +1548,13 @@ private open class Psi2kTranslator(
     if (replace != null) {
       seen(reference)
       reference.children().replaceNotNull {
-        runIf(it == reference.referenceNameElement) { replace }
+        when {
+          it == reference.referenceNameElement -> replace
+          // Drop any type qualifiers, which in particular rewrites (fully) qualified references the
+          // same as if they were imported.
+          it is PsiJavaCodeReferenceElement || it.tokenOrNull() == "." -> ""
+          else -> null
+        }
       }
     } else {
       super.visitReferenceElement(reference)
@@ -2142,6 +2148,7 @@ private open class Psi2kTranslator(
 
     val MAPPED_TYPES: Map<String, String> =
       mapOf(
+        // go/keep-sorted start
         "java.lang.Boolean" to "Boolean",
         "java.lang.Byte" to "Byte",
         "java.lang.Character" to "Char",
@@ -2153,12 +2160,13 @@ private open class Psi2kTranslator(
         "java.lang.Long" to "Long",
         "java.lang.Object" to "Any",
         "java.lang.Short" to "Short",
-        "java.util.Iterator" to "Iterator",
         "java.util.Collection" to "MutableCollection",
+        "java.util.Iterator" to "Iterator",
         "java.util.List" to "MutableList",
         "java.util.Map" to "MutableMap",
-        // TODO(b/273549101): map "java.util.Map.Entry" to "MutableMap.MutableEntry",
+        "java.util.Map.Entry" to "MutableMap.MutableEntry",
         "java.util.Set" to "MutableSet",
+        // go/keep-sorted end
       )
 
     val MAPPED_OPERATORS: Map<String, String> =
