@@ -31,6 +31,7 @@ import com.google.devtools.jvmtools.analysis.nullness.isInNullMarkedScope
 import com.google.devtools.jvmtools.analysis.nullness.isNonNullAnno
 import com.google.devtools.jvmtools.analysis.nullness.isNullableAnno
 import com.google.devtools.jvmtools.analysis.nullness.returnValueNullness
+import com.intellij.java.syntax.parser.JavaKeywords
 import com.intellij.lang.java.JavaLanguage
 import com.intellij.psi.JavaElementVisitor
 import com.intellij.psi.JavaRecursiveElementVisitor
@@ -402,7 +403,7 @@ private open class Psi2kTranslator(
         }
         is PsiJavaToken ->
           when (child.text) {
-            PsiKeyword.DEFAULT -> child.replaceWith("=")
+            JavaKeywords.DEFAULT -> child.replaceWith("=")
             ";" -> child.replaceWith(",")
             else -> doAccept(child)
           }
@@ -639,9 +640,9 @@ private open class Psi2kTranslator(
         .takeWhile { it != node.rBrace }
         .replaceNotNull { child ->
           when (child.tokenOrNull()) {
-            PsiKeyword.ENUM -> "enum class"
+            JavaKeywords.ENUM -> "enum class"
             "@" -> "annotation "
-            PsiKeyword.INTERFACE -> if (node.isAnnotationType) "class" else "interface"
+            JavaKeywords.INTERFACE -> if (node.isAnnotationType) "class" else "interface"
             "{" -> if (node.isAnnotationType) "(" else "{"
             "," ->
               if (
@@ -810,7 +811,7 @@ private open class Psi2kTranslator(
       .forEach { child ->
         val token = child.tokenOrNull()
         when {
-          token == PsiKeyword.FOR -> {
+          token == JavaKeywords.FOR -> {
             seen(child)
             data.append("while")
           }
@@ -872,7 +873,7 @@ private open class Psi2kTranslator(
   override fun visitImportStaticStatement(statement: PsiImportStaticStatement) {
     // Drop `static`, quite simply (auto-formatter will resort imports)
     seen(statement)
-    statement.children().acceptEach { it.text != PsiKeyword.STATIC }
+    statement.children().acceptEach { it.text != JavaKeywords.STATIC }
   }
 
   override fun visitImportStaticReferenceElement(reference: PsiImportStaticReferenceElement) {
@@ -899,10 +900,10 @@ private open class Psi2kTranslator(
 
   override fun visitJavaToken(token: PsiJavaToken) {
     when (token.text) {
-      PsiKeyword.NEW -> seen(token) // `new` doesn't translate to Kotlin, so just skip it
-      PsiKeyword.INSTANCEOF -> token.replaceWith("is") // x instanceof Foo ==> x is Foo
-      PsiKeyword.SWITCH -> token.replaceWith("when")
-      PsiKeyword.YIELD -> token.replaceWith("return@switch") // see visitSwitchExpr
+      JavaKeywords.NEW -> seen(token) // `new` doesn't translate to Kotlin, so just skip it
+      JavaKeywords.INSTANCEOF -> token.replaceWith("is") // x instanceof Foo ==> x is Foo
+      JavaKeywords.SWITCH -> token.replaceWith("when")
+      JavaKeywords.YIELD -> token.replaceWith("return@switch") // see visitSwitchExpr
       else -> super.visitJavaToken(token)
     }
   }
@@ -1206,16 +1207,17 @@ private open class Psi2kTranslator(
         is PsiKeyword ->
           when (it.text) {
             // static, volatile, transient handled above and with companion; default not needed
-            PsiKeyword.DEFAULT,
-            PsiKeyword.STATIC,
-            PsiKeyword.SYNCHRONIZED,
-            PsiKeyword.TRANSIENT,
-            PsiKeyword.VOLATILE -> false
+            JavaKeywords.DEFAULT,
+            JavaKeywords.STATIC,
+            JavaKeywords.SYNCHRONIZED,
+            JavaKeywords.TRANSIENT,
+            JavaKeywords.VOLATILE -> false
             // method parameters are always final; other variables are declared as val/var
-            PsiKeyword.FINAL -> parent !is PsiVariable
+            JavaKeywords.FINAL -> parent !is PsiVariable
             // Suppress `private` in private classes, which are accessible in Java but not Kotlin
             // TODO(kmb): consider only doing this if member is used from outside containing class
-            PsiKeyword.PRIVATE -> parent !is PsiMember || parent.containingClass?.isPrivate == false
+            JavaKeywords.PRIVATE ->
+              parent !is PsiMember || parent.containingClass?.isPrivate == false
             else -> true
           }
         is PsiAnnotation -> {
@@ -1594,15 +1596,15 @@ private open class Psi2kTranslator(
       if (child is PsiKeyword) {
         val token =
           when (child.text) {
-            PsiKeyword.EXTENDS -> ":"
-            PsiKeyword.IMPLEMENTS -> {
+            JavaKeywords.EXTENDS -> ":"
+            JavaKeywords.IMPLEMENTS -> {
               if ((list.parent as? PsiClass)?.extendsList?.referenceElements.isNullOrEmpty()) {
                 ":"
               } else {
                 ","
               }
             }
-            PsiKeyword.THROWS -> {
+            JavaKeywords.THROWS -> {
               suffix = ") "
               "@Throws("
             }
@@ -1670,7 +1672,7 @@ private open class Psi2kTranslator(
       seen(statement)
       statement.children().replaceNotNull {
         // Return to run {...} block inserted by visitLambdaExpression
-        runIf(it.tokenOrNull() == PsiKeyword.RETURN) { "return@run" }
+        runIf(it.tokenOrNull() == JavaKeywords.RETURN) { "return@run" }
       }
     } else {
       super.visitReturnStatement(statement)
@@ -1710,9 +1712,9 @@ private open class Psi2kTranslator(
     seen(statement)
     statement.children().replaceNotNull {
       when (it.tokenOrNull()) {
-        PsiKeyword.CASE,
+        JavaKeywords.CASE,
         ":" -> ""
-        PsiKeyword.DEFAULT -> "else"
+        JavaKeywords.DEFAULT -> "else"
         else -> null
       }
     }
@@ -1854,7 +1856,7 @@ private open class Psi2kTranslator(
       .filter { it != statement.resourceList }
       .forEach { child ->
         when {
-          !needTry && child.tokenOrNull() == PsiKeyword.TRY -> seen(child)
+          !needTry && child.tokenOrNull() == JavaKeywords.TRY -> seen(child)
           child == statement.tryBlock -> {
             seen(child)
             child.children().forEach {
@@ -2118,7 +2120,7 @@ private open class Psi2kTranslator(
   private companion object {
     val JAVA_LANG_OVERRIDE = Override::class.qualifiedName!!
 
-    val DELEGATION_KEYWORDS = setOf(PsiKeyword.THIS, PsiKeyword.SUPER)
+    val DELEGATION_KEYWORDS = setOf(JavaKeywords.THIS, JavaKeywords.SUPER)
     val PRIMITIVE_TYPES: Map<PsiType, String> =
       mapOf(
         PsiTypes.booleanType() to "Boolean",
