@@ -16,12 +16,11 @@
 
 package com.google.devtools.jvmtools.convert.psi2k
 
-import com.android.tools.lint.detector.api.isKotlin
 import com.intellij.psi.PsiMethodCallExpression
 import com.intellij.psi.util.InheritanceUtil
 import org.jetbrains.kotlin.analysis.api.analyze
 import org.jetbrains.kotlin.analysis.api.projectStructure.KaModuleProvider
-import org.jetbrains.kotlin.analysis.api.symbols.KaPropertySymbol
+import org.jetbrains.kotlin.analysis.api.symbols.KaKotlinPropertySymbol
 import org.jetbrains.kotlin.light.classes.symbol.annotations.getJvmNameFromAnnotation
 import org.jetbrains.kotlin.load.java.JvmAbi
 import org.jetbrains.kotlin.name.ClassId
@@ -59,9 +58,6 @@ data class MappedMethod(
       // Map calls to Kotlin property getters, which is required in Kotlin (b/354260950).
       // TODO: b/354260950 - handle extension properties, setters
       if (!call.argumentList.isEmpty) return null
-      if (!isKotlin(callee.language) && !declaringClass.hasAnnotation("kotlin.Metadata")) {
-        return null // @kotlin.Metadata indicates Kotlin declaration in binary dependency
-      }
       return analyze(KaModuleProvider.getInstance(call.project).getModule(call, null)) {
         // callee.callableSymbol doesn't work, so manually look for matching property (see KT-83483)
         val klass =
@@ -71,22 +67,23 @@ data class MappedMethod(
                 ?: return@analyze null
             )
           )
-        val ktSymbol =
-          klass?.memberScope?.callables?.filterIsInstance<KaPropertySymbol>()?.firstOrNull {
+        klass
+          ?.memberScope
+          ?.callables
+          ?.filterIsInstance<KaKotlinPropertySymbol>()
+          ?.firstOrNull {
             val getterName =
               it.getter?.getJvmNameFromAnnotation() ?: JvmAbi.getterName(it.name.identifier)
             getterName == callee.name
           }
-        if (ktSymbol != null) {
-          MappedMethod(
-            className = declaringClass.qualifiedName ?: "<anonymous>",
-            javaMethodName = callee.name,
-            kotlinName = ktSymbol.name.identifier,
-            type = MappingType.PROPERTY,
-          )
-        } else {
-          null
-        }
+          ?.let { ktSymbol ->
+            MappedMethod(
+              className = declaringClass.qualifiedName ?: "<anonymous>",
+              javaMethodName = callee.name,
+              kotlinName = ktSymbol.name.identifier,
+              type = MappingType.PROPERTY,
+            )
+          }
       }
     }
 
