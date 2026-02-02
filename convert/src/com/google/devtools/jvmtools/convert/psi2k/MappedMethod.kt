@@ -16,6 +16,7 @@
 
 package com.google.devtools.jvmtools.convert.psi2k
 
+import com.android.tools.lint.detector.api.isKotlin
 import com.intellij.psi.PsiMethodCallExpression
 import com.intellij.psi.util.InheritanceUtil
 import org.jetbrains.kotlin.analysis.api.analyze
@@ -58,6 +59,9 @@ data class MappedMethod(
       // Map calls to Kotlin property getters, which is required in Kotlin (b/354260950).
       // TODO: b/354260950 - handle extension properties, setters
       if (!call.argumentList.isEmpty) return null
+      if (!isKotlin(callee.language) && !declaringClass.hasAnnotation("kotlin.Metadata")) {
+        return null // @kotlin.Metadata indicates Kotlin declaration in binary dependency
+      }
       return analyze(KaModuleProvider.getInstance(call.project).getModule(call, null)) {
         // callee.callableSymbol doesn't work, so manually look for matching property (see KT-83483)
         val klass =
