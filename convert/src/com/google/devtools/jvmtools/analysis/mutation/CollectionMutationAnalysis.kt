@@ -55,6 +55,7 @@ import org.jetbrains.uast.UCallExpression
 import org.jetbrains.uast.UElement
 import org.jetbrains.uast.UExpression
 import org.jetbrains.uast.UFile
+import org.jetbrains.uast.UForEachExpression
 import org.jetbrains.uast.UIfExpression
 import org.jetbrains.uast.ULambdaExpression
 import org.jetbrains.uast.UMethod
@@ -290,13 +291,17 @@ private class CollectionMutationTransfer(
   override val bottom: State<Mutation>
     get() = CollectionMutationAnalysis.BOTTOM
 
+  @Suppress("DEPRECATION") // UVariable.psi gives us PsiVariable
   override fun visitVariable(
     node: UVariable,
     data: TransferInput<State<Mutation>>,
   ): TransferResult<State<Mutation>> {
-    val rhs = node.uastInitializer ?: return data.toNormalResult()
+    // Propagate from variable to its initializer or iterated collection, if any.
+    val rhs =
+      node.uastInitializer
+        ?: (node.uastParent as? UForEachExpression)?.iteratedValue
+        ?: return data.toNormalResult()
     val input = data.value()
-    @Suppress("DEPRECATION") // .psi gives us PsiVariable
     return TransferResult.normal(input.withValue(rhs, input.store.getOrUnused(node.psi)))
   }
 
@@ -419,7 +424,7 @@ private class CollectionMutationTransfer(
           // merge iterator etc.'s mutations into its originating collection
           "iterator",
           "listIterator",
-          "entries",
+          "entrySet",
           "keySet",
           "values" -> input.value.getOrUnused(node)
           else -> Mutation.READ
