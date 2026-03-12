@@ -1108,6 +1108,11 @@ private open class Psi2kTranslator(
         seen(child)
         for (methodElement in child.children()) {
           when {
+            // Insert `!!` before `.` if the qualifier expression is nullable, for consistency with
+            // visitReferenceExpression
+            methodElement.tokenOrNull() == "." &&
+              hasNullableValue(expression.methodExpression.qualifierExpression) ->
+              methodElement.replaceWith("!!.")
             methodElement == expression.methodExpression.referenceNameElement ->
               methodElement.replaceWith(mappedMethod.kotlinName)
             extension != null && methodElement == expression.methodExpression.qualifierExpression ->
@@ -1576,13 +1581,16 @@ private open class Psi2kTranslator(
       .children()
       .filter { it != expression.parameterList }
       .replaceNotNull {
-        // <array>.length ==> <array>.size
-        runIf(
+        when {
+          // Insert !! if qualifier is nullable. Note this is always consistent with the original
+          // code and kotlinc will generate warnings where unnecessary. But we only want to do this
+          // where needed to avoid adding !!s all over the place.
+          it.tokenOrNull() == "." && hasNullableValue(expression.qualifierExpression) -> "!!."
+          // <array>.length ==> <array>.size
           it == expression.referenceNameElement &&
             expression.referenceName == "length" &&
-            ((expression.qualifier as? PsiExpression)?.type?.arrayDimensions ?: 0) > 0
-        ) {
-          "size"
+            ((expression.qualifier as? PsiExpression)?.type?.arrayDimensions ?: 0) > 0 -> "size"
+          else -> null
         }
       }
     // type parameters (skipped above) last if any: Foo.<Bar>baz(...) ==> Foo.baz<Bar>(...)
@@ -2012,14 +2020,7 @@ private open class Psi2kTranslator(
   private fun inferredNullable(variable: PsiVariable?): Boolean {
     if (variable !is PsiLocalVariable && variable !is PsiParameter) return false
 
-    val root = variable.getParentOfTypes2<PsiMethod, PsiLambdaExpression>() ?: return false
-    val nullness =
-      when (val rootNode = root.toUElement()) {
-        is UMethod -> nullness(CfgRoot.of(rootNode))
-        is ULambdaExpression -> nullness(CfgRoot.of(rootNode))
-        else -> return false
-      }
-
+    val (root, nullness) = variable.nullness() ?: return false
     val noNullableBoundDeclared by lazy { !variable.type.hasNullableBound() }
 
     if (variable is PsiParameter) {
@@ -2058,6 +2059,21 @@ private open class Psi2kTranslator(
       }
     )
     return result
+  }
+
+  private fun PsiElement.nullness(): Pair<PsiElement, UAnalysis<State<Nullness>>>? {
+    val root = getParentOfTypes2<PsiMethod, PsiLambdaExpression>() ?: return null
+    return when (val rootNode = root.toUElement()) {
+      is UMethod -> root to nullness(CfgRoot.of(rootNode))
+      is ULambdaExpression -> root to nullness(CfgRoot.of(rootNode))
+      else -> return null
+    }
+  }
+
+  private fun hasNullableValue(expr: PsiExpression?): Boolean {
+    // null PsiExpression can't evaluate to null, so return false for it.
+    val (_, nullness) = expr?.nullness() ?: return false
+    return nullness.hasNullableValue(expr)
   }
 
   private fun inferredNullableReturn(method: PsiMethod?): Boolean {
@@ -2219,9 +2235,20 @@ private open class Psi2kTranslator(
 
     fun <K : Any, V> Map<out K, V>.getOrNull(key: K?): V? = if (key != null) get(key) else null
 
-    private fun PsiFile.isPackageDefaultImported(packageName: String): Boolean {
+    fun PsiFile.isPackageDefaultImported(packageName: String): Boolean {
       return packageName in DEFAULT_IMPORTED_PACKAGES ||
         packageName == toUElementOfType<UFile>()?.packageName
+    }
+
+    fun UAnalysis<State<Nullness>>.hasNullableValue(expr: PsiExpression): Boolean {
+      val value =
+        uastNodes(expr)
+          .filterIsInstance<UExpression>()
+          .mapNotNull { get(it).value[it] }
+          .reduceOrNull(Nullness::join) ?: Nullness.BOTTOM
+
+      return Nullness.NULL.implies(value) ||
+        (value == Nullness.PARAMETRIC && expr.type?.hasNullableBound() != true)
     }
   }
 }
