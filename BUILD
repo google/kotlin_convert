@@ -21,5 +21,7 @@ alias(
 
 define_kt_toolchain(
     name = "kotlin_toolchain",
-    jvm_target = "11",
+    api_version = "2.3",
+    jvm_target = "21",
+    language_version = "2.3",
 )

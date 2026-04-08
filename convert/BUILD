@@ -19,8 +19,7 @@ kt_jvm_library(
     srcs = glob(["src/**/*.kt"]),
     visibility = ["//:__pkg__"],
     deps = [
+        "@maven//:com_android_tools_lint_lint_api",
         "@maven//:com_github_ben_manes_caffeine_caffeine",
-        "@maven//:com_jetbrains_intellij_platform_uast",
-        "@maven//:org_jetbrains_kotlin_kotlin_compiler",
     ],
 )
