@@ -75,6 +75,7 @@ import com.intellij.psi.PsiIdentifier
 import com.intellij.psi.PsiImportStatement
 import com.intellij.psi.PsiImportStaticReferenceElement
 import com.intellij.psi.PsiImportStaticStatement
+import com.intellij.psi.PsiInstanceOfExpression
 import com.intellij.psi.PsiJavaCodeReferenceElement
 import com.intellij.psi.PsiJavaReference
 import com.intellij.psi.PsiJavaToken
@@ -896,6 +897,19 @@ private open class Psi2kTranslator(
     // For now, consider elements defined in non-binary Java files translated, as that should mean
     // they're in the same module, but includes generated files which we may not want.
     return element?.language == JavaLanguage.INSTANCE && !element.containingFile.fileType.isBinary
+  }
+
+  override fun visitInstanceOfExpression(expression: PsiInstanceOfExpression) {
+    val needParens =
+      expression.textContains('\n') && expression.parent !is PsiParenthesizedExpression
+    if (needParens) {
+      seen(expression)
+      data.append("(")
+      expression.children().forEach { doAccept(it) }
+      data.append(")")
+    } else {
+      super.visitInstanceOfExpression(expression)
+    }
   }
 
   override fun visitJavaToken(token: PsiJavaToken) {
