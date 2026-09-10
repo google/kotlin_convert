@@ -16,6 +16,7 @@
 
 package com.google.devtools.jvmtools.convert.psi2k
 
+import com.intellij.psi.PsiClass
 import com.intellij.psi.PsiMethodCallExpression
 import com.intellij.psi.util.InheritanceUtil
 import org.jetbrains.kotlin.analysis.api.analyze
@@ -23,7 +24,6 @@ import org.jetbrains.kotlin.analysis.api.projectStructure.KaModuleProvider
 import org.jetbrains.kotlin.analysis.api.symbols.KaKotlinPropertySymbol
 import org.jetbrains.kotlin.light.classes.symbol.annotations.getJvmNameFromAnnotation
 import org.jetbrains.kotlin.load.java.JvmAbi
-import org.jetbrains.kotlin.name.ClassId
 
 /** Type of method conversion. */
 enum class MappingType {
@@ -59,31 +59,32 @@ data class MappedMethod(
       // TODO: b/354260950 - handle extension properties, setters
       if (!call.argumentList.isEmpty) return null
       return analyze(KaModuleProvider.getInstance(call.project).getModule(call, null)) {
-        // callee.callableSymbol doesn't work, so manually look for matching property (see KT-83483)
-        val klass =
-          findClass(
-            ClassId.fromString(
-              declaringClass.qualifiedName?.replace('.', '/')?.replace('$', '.')
-                ?: return@analyze null
-            )
+        fun findProperty(psiClass: PsiClass): KaKotlinPropertySymbol? {
+          val classId = getClassId(psiClass) ?: return null
+          val klass = findClass(classId) ?: return null
+          return klass.memberScope.callables
+            .filterIsInstance<KaKotlinPropertySymbol>()
+            .firstOrNull {
+              val getterName =
+                it.getter?.getJvmNameFromAnnotation() ?: JvmAbi.getterName(it.name.identifier)
+              getterName == callee.name || it.name.identifier == callee.name
+            }
+        }
+
+        val prop =
+          findProperty(declaringClass)
+            ?: callee.allSuperMethods().firstNotNullOfOrNull { superMethod ->
+              superMethod.containingClass?.let { findProperty(it) }
+            }
+
+        prop?.let { ktSymbol ->
+          MappedMethod(
+            className = declaringClass.qualifiedName ?: "<anonymous>",
+            javaMethodName = callee.name,
+            kotlinName = ktSymbol.name.identifier,
+            type = MappingType.PROPERTY,
           )
-        klass
-          ?.memberScope
-          ?.callables
-          ?.filterIsInstance<KaKotlinPropertySymbol>()
-          ?.firstOrNull {
-            val getterName =
-              it.getter?.getJvmNameFromAnnotation() ?: JvmAbi.getterName(it.name.identifier)
-            getterName == callee.name
-          }
-          ?.let { ktSymbol ->
-            MappedMethod(
-              className = declaringClass.qualifiedName ?: "<anonymous>",
-              javaMethodName = callee.name,
-              kotlinName = ktSymbol.name.identifier,
-              type = MappingType.PROPERTY,
-            )
-          }
+        }
       }
     }
 
@@ -113,7 +114,8 @@ data class MappedMethod(
         // go/keep-sorted end
       )
 
-    private val MAPPED_METHODS_BY_NAME: Map<String, List<MappedMethod>> =
-      MAPPED_METHODS.groupBy { it.javaMethodName }
+    private val MAPPED_METHODS_BY_NAME: Map<String, List<MappedMethod>> = MAPPED_METHODS.groupBy {
+      it.javaMethodName
+    }
   }
 }
