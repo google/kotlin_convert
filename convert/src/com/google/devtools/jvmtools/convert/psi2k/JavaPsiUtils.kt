@@ -23,6 +23,7 @@ import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiExpression
 import com.intellij.psi.PsiJavaToken
 import com.intellij.psi.PsiLocalVariable
+import com.intellij.psi.PsiMethod
 import com.intellij.psi.PsiModifier
 import com.intellij.psi.PsiModifierList
 import com.intellij.psi.PsiModifierListOwner
@@ -32,6 +33,9 @@ import com.intellij.psi.PsiVariable
 import com.intellij.psi.impl.JavaConstantExpressionEvaluator.computeConstantExpression
 import com.intellij.psi.util.PsiUtil
 import com.intellij.psi.util.parentOfType
+import org.jetbrains.kotlin.name.ClassId
+import org.jetbrains.kotlin.name.FqName
+import org.jetbrains.kotlin.name.Name
 
 val PsiModifierListOwner.isAbstract: Boolean
   get() = hasModifierProperty(PsiModifier.ABSTRACT)
@@ -80,10 +84,47 @@ internal fun PsiExpression.constantValue(): Any? =
 
 /** Get name of a class with all its outer class names */
 internal fun PsiClass.getNameOfPossiblyInnerClass(): String {
-  val outerName = (parent as? PsiClass)?.getNameOfPossiblyInnerClass()
+  val outerName = (containingClass ?: parent as? PsiClass)?.getNameOfPossiblyInnerClass()
   return if (outerName == null) {
     name ?: ""
   } else {
     "$outerName.$name"
+  }
+}
+
+/** Get ClassId for a PsiClass, taking into account inner/nested classes. */
+internal fun getClassId(psiClass: PsiClass): ClassId? {
+  val parent = psiClass.containingClass
+  return if (parent != null) {
+    getClassId(parent)?.createNestedClassId(Name.identifier(psiClass.name ?: return null))
+  } else {
+    val qName = psiClass.qualifiedName ?: return null
+    ClassId.topLevel(FqName(qName))
+  }
+}
+
+/**
+ * Returns a sequence of all super methods of this method, traversed transitively breadth-first.
+ * Immediate super methods are yielded first, followed by higher ancestors in the hierarchy.
+ */
+internal fun PsiMethod.allSuperMethods(): Sequence<PsiMethod> {
+  val immediate = findSuperMethods()
+  if (immediate.isEmpty()) return emptySequence()
+  val queue = ArrayDeque<PsiMethod>()
+  val visited = mutableSetOf<PsiMethod>()
+  for (superMethod in immediate) {
+    if (visited.add(superMethod)) {
+      queue.add(superMethod)
+    }
+  }
+  return generateSequence {
+    if (queue.isEmpty()) return@generateSequence null
+    val current = queue.removeFirst()
+    for (superMethod in current.findSuperMethods()) {
+      if (visited.add(superMethod)) {
+        queue.add(superMethod)
+      }
+    }
+    current
   }
 }
