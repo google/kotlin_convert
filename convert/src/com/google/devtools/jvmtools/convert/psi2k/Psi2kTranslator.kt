@@ -48,6 +48,7 @@ import com.intellij.psi.PsiBinaryExpression
 import com.intellij.psi.PsiBlockStatement
 import com.intellij.psi.PsiBreakStatement
 import com.intellij.psi.PsiCall
+import com.intellij.psi.PsiCallExpression
 import com.intellij.psi.PsiCaseLabelElementList
 import com.intellij.psi.PsiCatchSection
 import com.intellij.psi.PsiClass
@@ -73,9 +74,12 @@ import com.intellij.psi.PsiForStatement
 import com.intellij.psi.PsiForeachStatement
 import com.intellij.psi.PsiIdentifier
 import com.intellij.psi.PsiImportStatement
+import com.intellij.psi.PsiImportStatementBase
 import com.intellij.psi.PsiImportStaticReferenceElement
 import com.intellij.psi.PsiImportStaticStatement
+import com.intellij.psi.PsiInstanceOfExpression
 import com.intellij.psi.PsiJavaCodeReferenceElement
+import com.intellij.psi.PsiJavaFile
 import com.intellij.psi.PsiJavaReference
 import com.intellij.psi.PsiJavaToken
 import com.intellij.psi.PsiKeyword
@@ -92,6 +96,7 @@ import com.intellij.psi.PsiModifierList
 import com.intellij.psi.PsiModifierListOwner
 import com.intellij.psi.PsiNameValuePair
 import com.intellij.psi.PsiNewExpression
+import com.intellij.psi.PsiPackageStatement
 import com.intellij.psi.PsiParameter
 import com.intellij.psi.PsiParameterList
 import com.intellij.psi.PsiParenthesizedExpression
@@ -106,6 +111,7 @@ import com.intellij.psi.PsiResourceList
 import com.intellij.psi.PsiResourceVariable
 import com.intellij.psi.PsiReturnStatement
 import com.intellij.psi.PsiStatement
+import com.intellij.psi.PsiSubstitutor
 import com.intellij.psi.PsiSuperExpression
 import com.intellij.psi.PsiSwitchBlock
 import com.intellij.psi.PsiSwitchExpression
@@ -131,8 +137,20 @@ import com.intellij.psi.util.TypeConversionUtil.isNumericType
 import com.intellij.psi.util.TypeConversionUtil.isPrimitiveAndNotNull
 import com.intellij.psi.util.TypeConversionUtil.isPrimitiveAndNotNullOrWrapper
 import com.intellij.psi.util.TypeConversionUtil.unboxAndBalanceTypes
+import com.intellij.psi.util.parentOfType
+import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.projectStructure.KaModuleProvider
+import org.jetbrains.kotlin.analysis.api.symbols.KaCallableSymbol
+import org.jetbrains.kotlin.analysis.api.symbols.KaClassKind
+import org.jetbrains.kotlin.analysis.api.symbols.KaKotlinPropertySymbol
+import org.jetbrains.kotlin.analysis.api.symbols.KaNamedClassSymbol
+import org.jetbrains.kotlin.analysis.api.symbols.KaSymbolOrigin
+import org.jetbrains.kotlin.analysis.api.types.KaClassType
 import org.jetbrains.kotlin.lexer.KtKeywordToken
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.light.classes.symbol.annotations.getJvmNameFromAnnotation
+import org.jetbrains.kotlin.load.java.JvmAbi
+import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfType
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfTypes2
 import org.jetbrains.uast.UElement
@@ -238,6 +256,204 @@ private open class Psi2kTranslator(
   private val seen: MutableMap<PsiElement, String>,
   private val nullness: (CfgRoot) -> UAnalysis<State<Nullness>>,
 ) : JavaElementVisitor() {
+  private val overriddenProperties: MutableMap<PsiMethod, String?> = mutableMapOf()
+  private val overriddenPropertyFields: MutableMap<PsiClass, Set<String>> = mutableMapOf()
+
+  private fun findOverriddenPropertyCached(method: PsiMethod): String? {
+    return overriddenProperties.getOrPut(method) { findOverriddenProperty(method) }
+  }
+
+  private fun findOverriddenProperty(method: PsiMethod): String? {
+    if (method.isConstructor || method.isStatic) return null
+    if (method.parameterList.parametersCount != 0) return null
+    val returnType = method.returnType ?: return null
+    if (returnType == PsiTypes.voidType()) return null
+
+    if (method.findSuperMethods().isEmpty()) return null
+
+    return try {
+      analyze(KaModuleProvider.getInstance(method.project).getModule(method, null)) {
+        for (superMethod in method.allSuperMethods()) {
+          val declaringClass = superMethod.containingClass ?: continue
+          val classId = getClassId(declaringClass) ?: continue
+          val klass = findClass(classId) ?: continue
+          val matchingProp =
+            klass.memberScope.callables.filterIsInstance<KaKotlinPropertySymbol>().firstOrNull {
+              prop ->
+              val getterName =
+                prop.getter?.getJvmNameFromAnnotation() ?: JvmAbi.getterName(prop.name.identifier)
+              getterName == method.name
+            }
+          if (matchingProp != null) {
+            return@analyze matchingProp.name.identifier
+          }
+        }
+        null
+      }
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  private fun isOverriddenPropertyField(field: PsiField): Boolean {
+    val containingClass = field.containingClass ?: return false
+    val fieldNames =
+      overriddenPropertyFields.getOrPut(containingClass) {
+        containingClass.methods
+          .filter { it.parameterList.parametersCount == 0 }
+          .mapNotNull { findOverriddenPropertyCached(it) }
+          .toSet()
+      }
+    return field.name in fieldNames
+  }
+
+  private fun isKotlinObjectInstanceAccess(expression: PsiReferenceExpression): Boolean {
+    if (expression.referenceName != "INSTANCE") return false
+    val targetField = expression.resolve() as? PsiField
+    val targetClass =
+      targetField?.containingClass
+        ?: (expression.qualifierExpression as? PsiJavaCodeReferenceElement)?.resolve() as? PsiClass
+        ?: return false
+    return isKotlinObject(targetClass, expression)
+  }
+
+  private fun isKotlinObject(psiClass: PsiClass, context: PsiElement): Boolean {
+    if (!isKotlinClass(psiClass, context)) return false
+    val classId = getClassId(psiClass) ?: return false
+    return runCatching {
+        analyze(KaModuleProvider.getInstance(context.project).getModule(context, null)) {
+          val symbol = findClass(classId) ?: return@analyze false
+          symbol.classKind == KaClassKind.OBJECT
+        }
+      }
+      .getOrDefault(false)
+  }
+
+  private fun isKotlinClass(psiClass: PsiClass, context: PsiElement): Boolean {
+    if (psiClass.language.id.equals("kotlin", ignoreCase = true)) {
+      return true
+    }
+    if (psiClass.hasAnnotation("kotlin.Metadata")) {
+      return true
+    }
+    val classId = getClassId(psiClass)
+    if (classId != null) {
+      val isKotlin =
+        runCatching {
+            analyze(KaModuleProvider.getInstance(context.project).getModule(context, null)) {
+              val symbol = findClass(classId)
+              symbol != null &&
+                symbol.origin != KaSymbolOrigin.JAVA_SOURCE &&
+                symbol.origin != KaSymbolOrigin.JAVA_LIBRARY
+            }
+          }
+          .getOrDefault(false)
+      if (isKotlin) return true
+    }
+    return false
+  }
+
+  private fun hasCompanionMember(
+    psiClass: PsiClass,
+    memberName: String?,
+    context: PsiElement,
+  ): Boolean {
+    val classId = getClassId(psiClass) ?: return false
+    return runCatching {
+        analyze(KaModuleProvider.getInstance(context.project).getModule(context, null)) {
+          val symbol = findClass(classId) as? KaNamedClassSymbol ?: return@analyze false
+          val companion = symbol.companionObject ?: return@analyze false
+          if (memberName == null) {
+            true
+          } else {
+            companion.memberScope.callables(Name.identifier(memberName)).any()
+          }
+        }
+      }
+      .getOrDefault(false)
+  }
+
+  private fun isEventBusSubscriber(element: PsiElement?): Boolean {
+    if (element is PsiClass) {
+      if (element.annotations.any { it.isSubscribeAnno() }) return true
+      if (element.methods.any { m -> m.annotations.any { it.isSubscribeAnno() } }) return true
+    }
+    if (element is PsiMethod) {
+      if (element.annotations.any { it.isSubscribeAnno() }) return true
+    }
+    if (element is PsiField) {
+      val resolvedClass = (element.type as? PsiClassType)?.resolve()
+      if (resolvedClass != null && isEventBusSubscriber(resolvedClass)) return true
+    }
+    return false
+  }
+
+  private fun PsiAnnotation.isSubscribeAnno(): Boolean =
+    qualifiedName == "com.google.android.apps.gmm.systems.eventbus.Subscribe" ||
+      qualifiedName?.endsWith(".Subscribe") == true
+
+  private fun renderKotlinType(type: PsiType, context: PsiElement? = null): String {
+    val prim = PRIMITIVE_TYPES[type]
+    if (prim != null) return prim
+    if (type is PsiWildcardType) {
+      val bound = type.bound
+      return if (!type.isBounded || bound == null) "*"
+      else if (type.isSuper) "in ${renderKotlinType(bound, context)}"
+      else "out ${renderKotlinType(bound, context)}"
+    }
+    if (type is PsiClassType) {
+      val rawType = (type as? PsiClassType)?.rawType()?.canonicalText ?: type.canonicalText
+      val mapped = MAPPED_TYPES[rawType]
+      val raw =
+        if (mapped != null) {
+          mapped
+        } else {
+          val resolvedClass = type.resolve()
+          if (resolvedClass != null && context != null) {
+            getKotlinTypeNameInContext(resolvedClass, context)
+          } else {
+            resolvedClass?.name ?: type.presentableText
+          }
+        }
+      val params = type.parameters
+      return if (params.isNotEmpty()) {
+        raw +
+          params.joinToString(prefix = "<", separator = ", ", postfix = ">") {
+            renderKotlinType(it, context)
+          }
+      } else {
+        raw
+      }
+    }
+    return type.presentableText
+  }
+
+  private fun getKotlinTypeNameInContext(targetClass: PsiClass, context: PsiElement): String {
+    val qName = targetClass.qualifiedName ?: return targetClass.name ?: ""
+    val outermostClass = generateSequence(targetClass) { it.containingClass }.last()
+    val outermostQName = outermostClass.qualifiedName
+    val realPackageName = outermostQName?.substringBeforeLast('.', "") ?: ""
+    if (realPackageName == "java.lang" || realPackageName == "kotlin") {
+      return targetClass.getNameOfPossiblyInnerClass()
+    }
+    val javaFile = context.containingFile as? PsiJavaFile
+    if (javaFile?.packageName == realPackageName) {
+      return targetClass.getNameOfPossiblyInnerClass()
+    }
+    val importList = javaFile?.importList
+    val allImports = importList?.allImportStatements ?: emptyArray()
+    if (allImports.any { !it.isOnDemand && it.importReference?.qualifiedName == qName }) {
+      return targetClass.name ?: qName
+    }
+    if (allImports.any { !it.isOnDemand && it.importReference?.qualifiedName == outermostQName }) {
+      return targetClass.getNameOfPossiblyInnerClass()
+    }
+    if (allImports.any { it.isOnDemand && it.importReference?.qualifiedName == realPackageName }) {
+      return targetClass.getNameOfPossiblyInnerClass()
+    }
+    return qName
+  }
+
   /**
    * Helper for [skipRecursive] that recursively marks nodes as [seen] and copies comments and
    * whitespace to [data].
@@ -276,6 +492,14 @@ private open class Psi2kTranslator(
     check(seen.putIfAbsent(element, translation) == null || element is PsiWhiteSpace) {
       "$element ${element.textRange} visited twice: ```${element.text}```"
     }
+  }
+
+  protected fun markSeenRecursive(element: PsiElement?) {
+    if (element == null) return
+    if (element !in seen) {
+      seen(element)
+    }
+    element.children().forEach { markSeenRecursive(it) }
   }
 
   /** Skips over [node] and its transitive children, preserving comments and whitespace. */
@@ -519,7 +743,11 @@ private open class Psi2kTranslator(
    * Returns any conversion to apply to [rhs] in order to assign it to a variable of [lhsType] per
    * https://docs.oracle.com/javase/specs/jls/se11/html/jls-5.html#jls-5.2.
    */
-  private fun assignmentConversion(lhsType: PsiType?, rhs: PsiExpression?): String? {
+  private fun assignmentConversion(
+    lhsType: PsiType?,
+    rhs: PsiExpression?,
+    isMethodArgument: Boolean = false,
+  ): String? {
     val unboxedLhsType = PsiPrimitiveType.getOptionallyUnboxedType(lhsType)
     val unboxedRhsType = PsiPrimitiveType.getOptionallyUnboxedType(rhs?.type)
     return runIf(
@@ -528,6 +756,7 @@ private open class Psi2kTranslator(
         unboxedLhsType != unboxedRhsType &&
         (unboxedLhsType == PsiTypes.charType() ||
           !isIntegralNumberType(unboxedLhsType) ||
+          isMethodArgument ||
           rhs !is PsiLiteralExpression)
     ) {
       // Implicit primitive conversions must be made explicit, except when assigning a literal to
@@ -749,28 +978,168 @@ private open class Psi2kTranslator(
     // For expression lists that are call arguments, see if we need to insert spread operator (`*`).
     // Note PsiMethodCall, PsiConstructorCall, and PsiEnumConstant have args, so it's convenient
     // to do this in visitExpressionList, but this element also appears in other contexts.
-    val callee = (list.parent as? PsiCall)?.resolveMethod()
-    // TODO(b/331194042): widening primitive conversions during invocations (JSL ch 5.3)
-    if (callee?.isVarArgs == true && callee.parameterList.parametersCount == list.expressionCount) {
-      // Since callee has vararg param and there are as many args as params, last arg must exist
-      val lastArg = list.expressions[list.expressionCount - 1]
-      // Insert spread operator (`*`) if lastArg is an array, which we test here by comparing the
-      // (type parameter substituted) parameter type with lastArg's type. This works because the
-      // vararg parameter's type is the encoded array type.
-      val paramType =
-        (list.parent as? PsiCall)?.resolveMethodGenerics()?.substitutor?.let {
-          callee.getSignature(it).parameterTypes.lastOrNull()
-        } ?: callee.parameterList.getParameter(callee.parameterList.parametersCount - 1)?.type
-      if (lastArg.type?.let { argType -> paramType?.isAssignableFrom(argType) } == true) {
-        seen(list)
-        list.children().forEach { child ->
-          if (child == lastArg) data.append("*")
-          doAccept(child)
+    val call = list.parent as? PsiCall
+    val methodGenerics = call?.resolveMethodGenerics()
+    val callee = (methodGenerics?.element as? PsiMethod) ?: call?.resolveMethod()
+    val substitutor = methodGenerics?.substitutor
+    val isVarArgSpread =
+      callee?.isVarArgs == true &&
+        callee.parameterList.parametersCount == list.expressionCount &&
+        run {
+          val lastArg = list.expressions[list.expressionCount - 1]
+          val paramType =
+            substitutor?.let { callee.getSignature(it).parameterTypes.lastOrNull() }
+              ?: callee.parameterList.getParameter(callee.parameterList.parametersCount - 1)?.type
+          lastArg.type?.let { argType -> paramType?.isAssignableFrom(argType) } == true
         }
-        return
+
+    seen(list)
+    val lastArg = if (isVarArgSpread) list.expressions[list.expressionCount - 1] else null
+    for (child in list.children()) {
+      if (child is PsiExpression) {
+        if (child == lastArg) data.append("*")
+        val argIndex = list.expressions.indexOf(child)
+        val param =
+          if (callee != null && argIndex in 0 until callee.parameterList.parametersCount) {
+            callee.parameterList.getParameter(argIndex)
+          } else null
+        val paramType = param?.let { substitutor?.substitute(it.type) ?: it.type }
+        val conversion = assignmentConversion(paramType, child, isMethodArgument = true)
+        when {
+          conversion != null -> {
+            child.encloseInParensIfNeeded(conversion) {
+              doAccept(it)
+              if (param != null && needsBangBangArgument(child, param)) {
+                data.append("!!")
+              }
+            }
+          }
+          else -> {
+            doAccept(child)
+            if (param != null) {
+              if (needsBangBangArgument(child, param)) {
+                data.append("!!")
+              } else {
+                val observerCast = getObserverCast(child, param, substitutor, call)
+                if (observerCast != null) {
+                  data.append(observerCast)
+                }
+              }
+            }
+          }
+        }
+      } else {
+        doAccept(child)
       }
     }
-    super.visitExpressionList(list)
+  }
+
+  private fun needsBangBangArgument(arg: PsiExpression, param: PsiParameter): Boolean {
+    if (
+      indicatesNullable(param.type) ||
+        indicatesNullable(param.modifierList) ||
+        hasNullableAnno(param) ||
+        inferredNullable(param)
+    )
+      return false
+    if (hasNullableValue(arg)) return true
+    if (arg is PsiReferenceExpression) {
+      val target = arg.resolve()
+      if (target is PsiField && !target.hasModifierProperty(PsiModifier.FINAL)) {
+        if (target.type !is PsiPrimitiveType) {
+          return indicatesNullable(target.type) || hasNullableAnno(target)
+        }
+      }
+    }
+    if (arg is PsiMethodCallExpression) {
+      val method = arg.resolveMethod()
+      if (method != null && method.returnType !is PsiPrimitiveType) {
+        return indicatesNullable(method.returnType) || hasNullableAnno(method)
+      }
+    }
+    return false
+  }
+
+  private fun getObserverCast(
+    arg: PsiExpression,
+    param: PsiParameter,
+    substitutor: PsiSubstitutor?,
+    call: PsiCall?,
+  ): String? {
+    val argType = arg.type as? PsiClassType ?: return null
+    val qualName = argType.resolve()?.qualifiedName ?: ""
+    if (qualName != "com.google.android.libraries.geo.systems.observablestate.Observer") return null
+    val substitutedParamType =
+      (substitutor?.substitute(param.type) ?: param.type) as? PsiClassType ?: return null
+    val paramQualName = substitutedParamType.resolve()?.qualifiedName ?: ""
+    if (paramQualName != "com.google.android.libraries.geo.systems.observablestate.Observer")
+      return null
+    val paramParam =
+      substitutedParamType.parameters.firstOrNull() as? PsiWildcardType ?: return null
+    val bound = paramParam.bound ?: return null
+    val argParam = argType.parameters.firstOrNull() ?: return null
+
+    if (bound is PsiTypeParameter) return null
+
+    val qualExpr = (call as? PsiMethodCallExpression)?.methodExpression?.qualifierExpression
+    val qualType = qualExpr?.type as? PsiClassType
+    val qualElemType = qualType?.parameters?.firstOrNull()
+
+    val qualContainsNullableFromPsi =
+      qualType?.presentableText?.contains("?") == true ||
+        qualElemType?.presentableText?.contains("?") == true ||
+        (qualElemType != null && indicatesNullable(qualElemType))
+
+    val qualContainsNullableFromAnalysis = run {
+      if (qualContainsNullableFromPsi) return@run true
+      val project = call?.project ?: return@run false
+      val qualMethod = (qualExpr as? PsiMethodCallExpression)?.resolveMethod()
+      val qualField = (qualExpr as? PsiReferenceExpression)?.resolve() as? PsiField
+      val declaringClass =
+        qualMethod?.containingClass ?: qualField?.containingClass ?: return@run false
+      val targetName = qualMethod?.name ?: qualField?.name ?: return@run false
+      try {
+        analyze(KaModuleProvider.getInstance(project).getModule(call, null)) {
+          fun findPropertyOrCallable(psiClass: PsiClass): KaCallableSymbol? {
+            val classId = getClassId(psiClass) ?: return null
+            val klass = findClass(classId) ?: return null
+            return klass.memberScope.callables.firstOrNull {
+              if (it is KaKotlinPropertySymbol) {
+                val getterName =
+                  it.getter?.getJvmNameFromAnnotation() ?: JvmAbi.getterName(it.name.identifier)
+                getterName == targetName || it.name.identifier == targetName
+              } else {
+                it.callableId?.callableName?.asString() == targetName
+              }
+            }
+          }
+
+          val symbol =
+            findPropertyOrCallable(declaringClass)
+              ?: qualMethod?.findSuperMethods()?.firstNotNullOfOrNull { superMethod ->
+                superMethod.containingClass?.let { findPropertyOrCallable(it) }
+              }
+          val classType = symbol?.returnType as? KaClassType
+          val firstArg = classType?.typeArguments?.firstOrNull()?.type
+          firstArg?.isMarkedNullable == true
+        }
+      } catch (e: Exception) {
+        false
+      }
+    }
+
+    val qualContainsNullable = qualContainsNullableFromPsi || qualContainsNullableFromAnalysis
+
+    val argContainsNullable =
+      argType.presentableText.contains("?") ||
+        argParam.presentableText.contains("?") ||
+        indicatesNullable(argParam)
+
+    if (qualContainsNullable && !argContainsNullable) {
+      val renderedBound = renderKotlinType(bound, arg).removeSuffix("?")
+      return " as Observer<in $renderedBound?>"
+    }
+    return null
   }
 
   override fun visitExpressionStatement(statement: PsiExpressionStatement) {
@@ -881,21 +1250,73 @@ private open class Psi2kTranslator(
     reference.children().forEach { child ->
       doAccept(child)
       if (child == reference.classReference) {
-        val targetClass = reference.classReference.resolve()
-        if (isTranslated(targetClass)) {
-          // If the referenced class is also being translated, rewrite
+        val targetClass = reference.classReference.resolve() as? PsiClass
+        if (
+          targetClass != null &&
+            (isTranslatedCompanionMember(targetClass, reference) ||
+              hasCompanionMember(targetClass, reference.referenceName, reference))
+        ) {
+          // If the referenced class is also being translated or has a companion object member,
+          // rewrite
           // import my.pkg.Foo.bar ==> import my.pkg.Foo.Companion.bar
-          // since we move static declarations into the companion object (see visitMethod etc.)
+          // since static declarations are in the companion object (see visitMethod etc.)
           data.append(".Companion")
         }
       }
     }
   }
 
+  private fun isTranslatedCompanionMember(
+    targetClass: PsiClass,
+    reference: PsiImportStaticReferenceElement,
+  ): Boolean {
+    if (!isTranslated(targetClass)) return false
+    val memberName = reference.referenceName ?: return false
+
+    val resolved = reference.resolve()
+    if (resolved is PsiEnumConstant) return false
+    if (resolved is PsiClass) return false
+    if (resolved is PsiMethod && isGeneratedEnumMethod(resolved)) return false
+
+    if (targetClass.isEnum) {
+      if (targetClass.findFieldByName(memberName, false) is PsiEnumConstant) return false
+      if (memberName == "values" || memberName == "valueOf") {
+        val methods = targetClass.findMethodsByName(memberName, false)
+        if (methods.isEmpty() || methods.any { isGeneratedEnumMethod(it) }) return false
+      }
+    }
+    if (targetClass.findInnerClassByName(memberName, false) != null) return false
+
+    return true
+  }
+
+  private fun isGeneratedEnumMethod(method: PsiMethod): Boolean {
+    val parent = (method.containingClass ?: method.parent as? PsiClass) ?: return false
+    return method.isStatic &&
+      parent.isEnum &&
+      ((method.name == "values" && !method.hasParameters()) ||
+        (method.name == "valueOf" &&
+          method.parameterList.parametersCount == 1 &&
+          method.parameterList.getParameter(0)?.type?.equalsToText("java.lang.String") == true))
+  }
+
   private fun isTranslated(element: PsiElement?): Boolean {
     // For now, consider elements defined in non-binary Java files translated, as that should mean
     // they're in the same module, but includes generated files which we may not want.
     return element?.language == JavaLanguage.INSTANCE && !element.containingFile.fileType.isBinary
+  }
+
+  override fun visitInstanceOfExpression(expression: PsiInstanceOfExpression) {
+    val needParens =
+      expression.textContains('\n') && expression.parent !is PsiParenthesizedExpression
+    if (needParens) {
+      seen(expression)
+      data.append("(")
+      expression.children().forEach { doAccept(it) }
+      data.append(")")
+    } else {
+      super.visitInstanceOfExpression(expression)
+    }
   }
 
   override fun visitJavaToken(token: PsiJavaToken) {
@@ -999,7 +1420,7 @@ private open class Psi2kTranslator(
           doAccept(child)
         }
         if (child == node.nameIdentifier) {
-          visitTypeDeclaration(node.typeElement) { !it.isInferredType }
+          visitTypeDeclaration(node.typeElement) { !it.isInferredType && it.text != "var" }
         }
       }
   }
@@ -1030,14 +1451,44 @@ private open class Psi2kTranslator(
     seen(node)
 
     // Omit generated enum methods values(), valueOf("...")
-    if (
-      node.isStatic &&
-        (node.parent as? PsiClass)?.isEnum == true &&
-        ((node.name == "values" && !node.hasParameters()) ||
-          (node.name == "valueOf" &&
-            node.parameterList.parametersCount == 1 &&
-            node.parameterList.getParameter(0)!!.type.equalsToText("java.lang.String")))
-    ) {
+    if (isGeneratedEnumMethod(node)) {
+      return
+    }
+
+    val overriddenPropertyName = findOverriddenPropertyCached(node)
+    if (overriddenPropertyName != null) {
+      val matchingField = node.containingClass?.findFieldByName(overriddenPropertyName, false)
+      if (matchingField != null) {
+        markSeenRecursive(node)
+        return
+      }
+
+      companionIfStatic(node) {
+        node.children().forEach { child ->
+          when (child) {
+            node.modifierList -> {
+              doAccept(node.throwsList)
+              doAccept(child)
+              data.append(" val ")
+              data.append(overriddenPropertyName)
+            }
+            node.returnTypeElement -> visitTypeDeclaration(node.returnTypeElement)
+            node.body -> {
+              if (node.body != null) {
+                data.append("\n    get() ")
+                doAccept(node.body)
+              }
+            }
+            node.throwsList -> {}
+            node.nameIdentifier,
+            node.parameterList,
+            node.typeParameterList -> {
+              markSeenRecursive(child)
+            }
+            else -> seen(child)
+          }
+        }
+      }
       return
     }
 
@@ -1106,17 +1557,25 @@ private open class Psi2kTranslator(
     expression.children().forEach { child ->
       if (child == expression.methodExpression) {
         seen(child)
+        val needsBangBang = hasNullableValue(expression.methodExpression.qualifierExpression)
         for (methodElement in child.children()) {
           when {
-            // Insert `!!` before `.` if the qualifier expression is nullable, for consistency with
-            // visitReferenceExpression
-            methodElement.tokenOrNull() == "." &&
-              hasNullableValue(expression.methodExpression.qualifierExpression) ->
-              methodElement.replaceWith("!!.")
+            extension != null &&
+              methodElement == expression.methodExpression.qualifierExpression -> {
+              extension.encloseInParensIfNeeded { methodElement.replaceWith(extension) }
+              if (needsBangBang) {
+                data.append("!!")
+              }
+            }
+            methodElement == expression.methodExpression.qualifierExpression -> {
+              doAccept(methodElement)
+              if (needsBangBang) {
+                data.append("!!")
+              }
+            }
+            methodElement.tokenOrNull() == "." -> doAccept(methodElement)
             methodElement == expression.methodExpression.referenceNameElement ->
               methodElement.replaceWith(mappedMethod.kotlinName)
-            extension != null && methodElement == expression.methodExpression.qualifierExpression ->
-              extension.encloseInParensIfNeeded { methodElement.replaceWith(extension) }
             else -> doAccept(methodElement)
           }
         }
@@ -1203,7 +1662,12 @@ private open class Psi2kTranslator(
     if (node.hasModifierProperty(PsiModifier.TRANSIENT)) data.append("@Transient ")
     if (node.hasModifierProperty(PsiModifier.VOLATILE)) data.append("@Volatile ")
     if (parent is PsiMethod && node.isStatic) data.append("@JvmStatic ")
-    if (parent is PsiField && parent !is PsiEnumConstant && !node.isPrivate) {
+    if (
+      parent is PsiField &&
+        parent !is PsiEnumConstant &&
+        !node.isPrivate &&
+        !isOverriddenPropertyField(parent)
+    ) {
       data.append("@JvmField ")
     }
 
@@ -1222,7 +1686,10 @@ private open class Psi2kTranslator(
             // Suppress `private` in private classes, which are accessible in Java but not Kotlin
             // TODO(kmb): consider only doing this if member is used from outside containing class
             JavaKeywords.PRIVATE ->
-              parent !is PsiMember || parent.containingClass?.isPrivate == false
+              (parent !is PsiMember || parent.containingClass?.isPrivate == false) &&
+                !(parent is PsiField && isOverriddenPropertyField(parent))
+            JavaKeywords.PROTECTED,
+            JavaKeywords.PUBLIC -> !(parent is PsiField && isOverriddenPropertyField(parent))
             else -> true
           }
         is PsiAnnotation -> {
@@ -1237,7 +1704,9 @@ private open class Psi2kTranslator(
     if (
       parent !is PsiParameter &&
         parent !is PsiLocalVariable &&
-        node.hasModifierProperty(PsiModifier.PACKAGE_LOCAL)
+        node.hasModifierProperty(PsiModifier.PACKAGE_LOCAL) &&
+        !(parent is PsiField && isOverriddenPropertyField(parent)) &&
+        !isEventBusSubscriber(parent)
     ) {
       data.append(" internal ")
     }
@@ -1251,7 +1720,13 @@ private open class Psi2kTranslator(
     ) {
       data.append(" open ")
     }
-    if (node.hasAnnotation(JAVA_LANG_OVERRIDE)) data.append(" override ")
+    if (
+      node.hasAnnotation(JAVA_LANG_OVERRIDE) ||
+        (parent is PsiMethod && findOverriddenPropertyCached(parent) != null) ||
+        (parent is PsiField && isOverriddenPropertyField(parent))
+    ) {
+      data.append(" override ")
+    }
     if (parent is PsiClass && parent.parent !is PsiFile && !node.isStatic) {
       data.append(" inner ")
     }
@@ -1564,7 +2039,18 @@ private open class Psi2kTranslator(
         }
       }
     } else {
-      super.visitReferenceElement(reference)
+      val qualification = getQualificationIfNeeded(reference)
+      if (qualification != null) {
+        seen(reference)
+        reference.children().replaceNotNull {
+          when {
+            it == reference.referenceNameElement -> qualification
+            else -> null
+          }
+        }
+      } else {
+        super.visitReferenceElement(reference)
+      }
     }
 
     // References can include (type) annotations as children, so see if we have a nullable type.
@@ -1574,27 +2060,206 @@ private open class Psi2kTranslator(
     }
   }
 
+  private fun getQualificationIfNeeded(reference: PsiJavaCodeReferenceElement): String? {
+    if (reference.qualifier != null) return null
+    if (reference.referenceNameElement == null) return null
+
+    val targetClass = reference.resolve() as? PsiClass ?: return null
+    if (targetClass is PsiTypeParameter) return null
+    val containingClass = targetClass.containingClass ?: return null
+
+    var current: PsiElement? = reference
+    while (current != null) {
+      if (current is PsiImportStatementBase || current is PsiPackageStatement) return null
+      if (current == containingClass) return null
+      current = current.parent
+    }
+
+    val javaFile = reference.containingFile as? PsiJavaFile
+    val importList = javaFile?.importList
+    val allImports = importList?.allImportStatements ?: emptyArray()
+    val targetQName = targetClass.qualifiedName
+    if (targetQName != null && allImports.isNotEmpty()) {
+      if (allImports.any { !it.isOnDemand && it.importReference?.qualifiedName == targetQName }) {
+        return null
+      }
+      val containingQName = containingClass.qualifiedName
+      if (
+        containingQName != null &&
+          allImports.any { it.isOnDemand && it.importReference?.qualifiedName == containingQName }
+      ) {
+        return null
+      }
+    }
+
+    val outermostClass = generateSequence(containingClass) { it.containingClass }.last()
+    val outermostQName = outermostClass.qualifiedName
+    val packageName = outermostQName?.substringBeforeLast('.', "") ?: ""
+    val outermostInScope =
+      reference.containingFile.isPackageDefaultImported(packageName) ||
+        allImports.any { !it.isOnDemand && it.importReference?.qualifiedName == outermostQName } ||
+        allImports.any { it.isOnDemand && it.importReference?.qualifiedName == packageName }
+
+    return if (outermostInScope) {
+      targetClass.getNameOfPossiblyInnerClass()
+    } else {
+      targetClass.qualifiedName ?: targetClass.getNameOfPossiblyInnerClass()
+    }
+  }
+
   override fun visitReferenceExpression(expression: PsiReferenceExpression) {
     // This in particular includes variable and method references
+    if (expression.qualifierExpression == null) {
+      val qualification = getQualificationIfNeeded(expression)
+      if (qualification != null) {
+        expression.replaceWith(qualification)
+        return
+      }
+    }
     seen(expression)
-    expression
-      .children()
-      .filter { it != expression.parameterList }
-      .replaceNotNull {
-        when {
-          // Insert !! if qualifier is nullable. Note this is always consistent with the original
-          // code and kotlinc will generate warnings where unnecessary. But we only want to do this
-          // where needed to avoid adding !!s all over the place.
-          it.tokenOrNull() == "." && hasNullableValue(expression.qualifierExpression) -> "!!."
-          // <array>.length ==> <array>.size
-          it == expression.referenceNameElement &&
-            expression.referenceName == "length" &&
-            ((expression.qualifier as? PsiExpression)?.type?.arrayDimensions ?: 0) > 0 -> "size"
-          else -> null
+    val isKotlinObjectInstance = isKotlinObjectInstanceAccess(expression)
+    val needsBangBang = hasNullableValue(expression.qualifierExpression)
+    for (child in expression.children()) {
+      if (child == expression.parameterList) continue
+      if (isKotlinObjectInstance) {
+        if (child == expression.qualifierExpression) {
+          doAccept(child)
+        } else {
+          skipRecursive(child)
+        }
+        continue
+      }
+      when {
+        child == expression.qualifierExpression -> {
+          doAccept(child)
+          if (needsBangBang) {
+            data.append("!!")
+          }
+        }
+        child.tokenOrNull() == "." -> doAccept(child)
+        child == expression.referenceNameElement &&
+          expression.referenceName == "length" &&
+          ((expression.qualifier as? PsiExpression)?.type?.arrayDimensions ?: 0) > 0 ->
+          child.replaceWith("size")
+        else -> doAccept(child)
+      }
+    }
+    // type parameters (skipped above) last if any: Foo.<Bar>baz(...) ==> Foo.baz<Bar>(...)
+    if (!isKotlinObjectInstance) {
+      if (expression.parameterList?.typeArguments?.isNotEmpty() == true) {
+        doAccept(expression.parameterList)
+      } else {
+        val methodCall = expression.parent as? PsiMethodCallExpression
+        val inferredTypeArgs = getInferredFactoryTypeArguments(methodCall, expression)
+        if (inferredTypeArgs != null) {
+          expression.parameterList?.let { skipRecursive(it) }
+          data.append(inferredTypeArgs)
+        } else {
+          doAccept(expression.parameterList)
         }
       }
-    // type parameters (skipped above) last if any: Foo.<Bar>baz(...) ==> Foo.baz<Bar>(...)
-    doAccept(expression.parameterList)
+    } else {
+      expression.parameterList?.let { skipRecursive(it) }
+    }
+  }
+
+  private fun containsTypeParameter(type: PsiType?): Boolean {
+    if (type == null) return false
+    if (type is PsiWildcardType) {
+      return containsTypeParameter(type.bound)
+    }
+    if (type is PsiArrayType) {
+      return containsTypeParameter(type.componentType)
+    }
+    if (type is PsiClassType) {
+      val resolved = type.resolve()
+      if (resolved == null || resolved is PsiTypeParameter) return true
+      for (param in type.parameters) {
+        if (containsTypeParameter(param)) return true
+      }
+    }
+    return false
+  }
+
+  private fun renderCallTypeArgument(type: PsiType, context: PsiElement? = null): String? {
+    val concreteType =
+      when (type) {
+        is PsiWildcardType -> {
+          if (!type.isBounded || type.bound == null || type.isSuper) return null
+          type.bound!!
+        }
+        else -> type
+      }
+    if (containsTypeParameter(concreteType)) return null
+    var rendered = renderKotlinType(concreteType, context)
+    if (rendered.startsWith("out ")) {
+      rendered = rendered.removePrefix("out ")
+    } else if (rendered.startsWith("in ")) {
+      rendered = rendered.removePrefix("in ")
+    }
+    if (rendered == "*" || rendered.isEmpty()) return null
+    return rendered
+  }
+
+  private fun getInferredFactoryTypeArguments(
+    methodCall: PsiMethodCallExpression?,
+    expression: PsiReferenceExpression,
+  ): String? {
+    if (methodCall == null) return null
+    val qualClass =
+      (expression.qualifierExpression as? PsiReferenceExpression)?.resolve() as? PsiClass
+        ?: (expression.resolve() as? PsiMethod)?.containingClass
+    val qualClassName = qualClass?.qualifiedName ?: return null
+    val expectedParamCount =
+      when (qualClassName) {
+        "com.google.common.collect.ImmutableList" -> 1
+        "com.google.common.collect.ImmutableSet" -> 1
+        "com.google.common.collect.ImmutableMap" -> 2
+        else -> return null
+      }
+
+    val exprList = methodCall.parent as? PsiExpressionList ?: return null
+    val enclosingCall = exprList.parent as? PsiCall ?: return null
+    val argIndex = exprList.expressions.indexOf(methodCall)
+    if (argIndex < 0) return null
+
+    val methodGenerics =
+      (enclosingCall as? PsiCallExpression)?.resolveMethodGenerics()
+        ?: enclosingCall.resolveMethodGenerics()
+    val enclosingMethod =
+      (methodGenerics?.element as? PsiMethod) ?: enclosingCall.resolveMethod() ?: return null
+    val targetParam = enclosingMethod.parameterList.getParameter(argIndex) ?: return null
+
+    val substitutor = methodGenerics?.substitutor
+    val substitutedType = substitutor?.substitute(targetParam.type) ?: targetParam.type
+    val targetClassType = substitutedType as? PsiClassType ?: return null
+    val targetClass = targetClassType.resolve() ?: return null
+    val targetClassName = targetClass.qualifiedName ?: return null
+
+    val isCompatible =
+      targetClassName == qualClassName ||
+        when (qualClassName) {
+          "com.google.common.collect.ImmutableList" ->
+            targetClassName in IMMUTABLE_LIST_COMPATIBLE_CLASSES
+          "com.google.common.collect.ImmutableSet" ->
+            targetClassName in IMMUTABLE_SET_COMPATIBLE_CLASSES
+          "com.google.common.collect.ImmutableMap" ->
+            targetClassName in IMMUTABLE_MAP_COMPATIBLE_CLASSES
+          else -> false
+        }
+    if (!isCompatible) return null
+
+    val typeParameters = targetClassType.parameters
+    if (typeParameters.size != expectedParamCount) return null
+
+    val renderedArgs = mutableListOf<String>()
+    for (paramType in typeParameters) {
+      val rendered = renderCallTypeArgument(paramType, expression) ?: return null
+      renderedArgs.add(rendered)
+    }
+
+    if (renderedArgs.size != expectedParamCount) return null
+    return renderedArgs.joinToString(prefix = "<", separator = ", ", postfix = ">")
   }
 
   override fun visitReferenceList(list: PsiReferenceList) {
@@ -1643,8 +2308,46 @@ private open class Psi2kTranslator(
   override fun visitReferenceParameterList(list: PsiReferenceParameterList) {
     val elements = list.typeParameterElements
     if (elements.isNotEmpty() && elements.all { it.type is PsiDiamondType }) {
-      // Omit <> (diamond type parameter list) entirely
-      skipRecursive(list)
+      val newExpr =
+        (list.parent?.parent as? PsiNewExpression)
+          ?: (list.parent?.parent as? PsiAnonymousClass)?.parent as? PsiNewExpression
+      val anonClass = newExpr?.anonymousClass ?: (list.parent?.parent as? PsiAnonymousClass)
+      val inferredTypes =
+        (elements.firstOrNull()?.type as? PsiDiamondType)?.resolveInferredTypes()?.types
+      val typesToRender =
+        when {
+          !inferredTypes.isNullOrEmpty() && inferredTypes.none { it is PsiDiamondType } ->
+            inferredTypes.toList()
+          anonClass != null &&
+            anonClass.baseClassType.parameters.isNotEmpty() &&
+            anonClass.baseClassType.parameters.none { it is PsiDiamondType } ->
+            anonClass.baseClassType.parameters.toList()
+          else -> {
+            val expectedType =
+              when (val parent = newExpr?.parent) {
+                is PsiVariable -> parent.type as? PsiClassType
+                is PsiAssignmentExpression -> parent.lExpression.type as? PsiClassType
+                is PsiReturnStatement ->
+                  (parent.parentOfType<PsiMethod>()?.returnType as? PsiClassType)
+                else -> null
+              }
+            expectedType
+              ?.parameters
+              ?.takeIf { it.isNotEmpty() && it.none { p -> p is PsiDiamondType } }
+              ?.toList()
+          }
+        }
+      if (anonClass != null && !typesToRender.isNullOrEmpty()) {
+        skipRecursive(list)
+        data.append(
+          typesToRender.joinToString(prefix = "<", separator = ", ", postfix = ">") {
+            renderKotlinType(it, list)
+          }
+        )
+      } else {
+        // Omit <> (diamond type parameter list) entirely
+        skipRecursive(list)
+      }
     } else {
       super.visitReferenceParameterList(list)
     }
@@ -1669,7 +2372,7 @@ private open class Psi2kTranslator(
       .children()
       .filter { it != variable.initializer && it != variable.typeElement }
       .acceptEach { it.tokenOrNull() != "=" }
-    visitTypeDeclaration(variable.typeElement) { !it.isInferredType }
+    visitTypeDeclaration(variable.typeElement) { !it.isInferredType && it.text != "var" }
     data.append(" -> ")
   }
 
@@ -2032,6 +2735,12 @@ private open class Psi2kTranslator(
     }
 
     fun PsiExpression.requiresNullable(): Boolean {
+      if (this is PsiMethodCallExpression) {
+        val methodName = methodExpression.referenceName
+        if (methodName == "checkNotNull" || methodName == "requireNonNull") {
+          return false
+        }
+      }
       val value =
         nullness
           .uastNodes(this)
@@ -2072,6 +2781,12 @@ private open class Psi2kTranslator(
 
   private fun hasNullableValue(expr: PsiExpression?): Boolean {
     // null PsiExpression can't evaluate to null, so return false for it.
+    if (expr is PsiMethodCallExpression) {
+      val methodName = expr.methodExpression.referenceName
+      if (methodName == "checkNotNull" || methodName == "requireNonNull") {
+        return false
+      }
+    }
     val (_, nullness) = expr?.nullness() ?: return false
     return nullness.hasNullableValue(expr)
   }
@@ -2186,6 +2901,27 @@ private open class Psi2kTranslator(
         "java.util.Set" to "MutableSet",
         // go/keep-sorted end
       )
+
+    val IMMUTABLE_LIST_COMPATIBLE_CLASSES: Set<String> =
+      setOf(
+        "com.google.common.collect.ImmutableList",
+        "com.google.common.collect.ImmutableCollection",
+        "java.util.List",
+        "java.util.Collection",
+        "java.lang.Iterable",
+      )
+
+    val IMMUTABLE_SET_COMPATIBLE_CLASSES: Set<String> =
+      setOf(
+        "com.google.common.collect.ImmutableSet",
+        "com.google.common.collect.ImmutableCollection",
+        "java.util.Set",
+        "java.util.Collection",
+        "java.lang.Iterable",
+      )
+
+    val IMMUTABLE_MAP_COMPATIBLE_CLASSES: Set<String> =
+      setOf("com.google.common.collect.ImmutableMap", "java.util.Map")
 
     val MAPPED_OPERATORS: Map<String, String> =
       mapOf("<<" to "shl", ">>" to "shr", ">>>" to "ushr", "&" to "and", "|" to "or", "^" to "xor")
