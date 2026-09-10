@@ -73,9 +73,12 @@ import com.intellij.psi.PsiForStatement
 import com.intellij.psi.PsiForeachStatement
 import com.intellij.psi.PsiIdentifier
 import com.intellij.psi.PsiImportStatement
+import com.intellij.psi.PsiImportStatementBase
 import com.intellij.psi.PsiImportStaticReferenceElement
 import com.intellij.psi.PsiImportStaticStatement
+import com.intellij.psi.PsiInstanceOfExpression
 import com.intellij.psi.PsiJavaCodeReferenceElement
+import com.intellij.psi.PsiJavaFile
 import com.intellij.psi.PsiJavaReference
 import com.intellij.psi.PsiJavaToken
 import com.intellij.psi.PsiKeyword
@@ -92,6 +95,7 @@ import com.intellij.psi.PsiModifierList
 import com.intellij.psi.PsiModifierListOwner
 import com.intellij.psi.PsiNameValuePair
 import com.intellij.psi.PsiNewExpression
+import com.intellij.psi.PsiPackageStatement
 import com.intellij.psi.PsiParameter
 import com.intellij.psi.PsiParameterList
 import com.intellij.psi.PsiParenthesizedExpression
@@ -131,8 +135,17 @@ import com.intellij.psi.util.TypeConversionUtil.isNumericType
 import com.intellij.psi.util.TypeConversionUtil.isPrimitiveAndNotNull
 import com.intellij.psi.util.TypeConversionUtil.isPrimitiveAndNotNullOrWrapper
 import com.intellij.psi.util.TypeConversionUtil.unboxAndBalanceTypes
+import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.projectStructure.KaModuleProvider
+import org.jetbrains.kotlin.analysis.api.symbols.KaClassKind
+import org.jetbrains.kotlin.analysis.api.symbols.KaKotlinPropertySymbol
+import org.jetbrains.kotlin.analysis.api.symbols.KaNamedClassSymbol
+import org.jetbrains.kotlin.analysis.api.symbols.KaSymbolOrigin
 import org.jetbrains.kotlin.lexer.KtKeywordToken
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.light.classes.symbol.annotations.getJvmNameFromAnnotation
+import org.jetbrains.kotlin.load.java.JvmAbi
+import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfType
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfTypes2
 import org.jetbrains.uast.UElement
@@ -238,6 +251,142 @@ private open class Psi2kTranslator(
   private val seen: MutableMap<PsiElement, String>,
   private val nullness: (CfgRoot) -> UAnalysis<State<Nullness>>,
 ) : JavaElementVisitor() {
+  private val overriddenProperties: MutableMap<PsiMethod, String?> = mutableMapOf()
+  private val overriddenPropertyFields: MutableMap<PsiClass, Set<String>> = mutableMapOf()
+
+  private fun findOverriddenPropertyCached(method: PsiMethod): String? {
+    return overriddenProperties.getOrPut(method) { findOverriddenProperty(method) }
+  }
+
+  private fun findOverriddenProperty(method: PsiMethod): String? {
+    if (method.isConstructor || method.isStatic) return null
+    if (method.parameterList.parametersCount != 0) return null
+    val returnType = method.returnType ?: return null
+    if (returnType == PsiTypes.voidType()) return null
+
+    if (method.findSuperMethods().isEmpty()) return null
+
+    return try {
+      analyze(KaModuleProvider.getInstance(method.project).getModule(method, null)) {
+        for (superMethod in method.allSuperMethods()) {
+          val declaringClass = superMethod.containingClass ?: continue
+          val classId = getClassId(declaringClass) ?: continue
+          val klass = findClass(classId) ?: continue
+          val matchingProp =
+            klass.memberScope.callables.filterIsInstance<KaKotlinPropertySymbol>().firstOrNull {
+              prop ->
+              val getterName =
+                prop.getter?.getJvmNameFromAnnotation() ?: JvmAbi.getterName(prop.name.identifier)
+              getterName == method.name
+            }
+          if (matchingProp != null) {
+            return@analyze matchingProp.name.identifier
+          }
+        }
+        null
+      }
+    } catch (_: Exception) {
+      null
+    }
+  }
+
+  private fun isOverriddenPropertyField(field: PsiField): Boolean {
+    val containingClass = field.containingClass ?: return false
+    val fieldNames =
+      overriddenPropertyFields.getOrPut(containingClass) {
+        containingClass.methods
+          .filter { it.parameterList.parametersCount == 0 }
+          .mapNotNull { findOverriddenPropertyCached(it) }
+          .toSet()
+      }
+    return field.name in fieldNames
+  }
+
+  private fun isKotlinObjectInstanceAccess(expression: PsiReferenceExpression): Boolean {
+    if (expression.referenceName != "INSTANCE") return false
+    val targetField = expression.resolve() as? PsiField
+    val targetClass =
+      targetField?.containingClass
+        ?: (expression.qualifierExpression as? PsiJavaCodeReferenceElement)?.resolve() as? PsiClass
+        ?: return false
+    return isKotlinObject(targetClass, expression)
+  }
+
+  private fun isKotlinObject(psiClass: PsiClass, context: PsiElement): Boolean {
+    if (!isKotlinClass(psiClass, context)) return false
+    val classId = getClassId(psiClass) ?: return false
+    return runCatching {
+        analyze(KaModuleProvider.getInstance(context.project).getModule(context, null)) {
+          val symbol = findClass(classId) ?: return@analyze false
+          symbol.classKind == KaClassKind.OBJECT
+        }
+      }
+      .getOrDefault(false)
+  }
+
+  private fun isKotlinClass(psiClass: PsiClass, context: PsiElement): Boolean {
+    if (psiClass.language.id.equals("kotlin", ignoreCase = true)) {
+      return true
+    }
+    if (psiClass.hasAnnotation("kotlin.Metadata")) {
+      return true
+    }
+    val classId = getClassId(psiClass)
+    if (classId != null) {
+      val isKotlin =
+        runCatching {
+            analyze(KaModuleProvider.getInstance(context.project).getModule(context, null)) {
+              val symbol = findClass(classId)
+              symbol != null &&
+                symbol.origin != KaSymbolOrigin.JAVA_SOURCE &&
+                symbol.origin != KaSymbolOrigin.JAVA_LIBRARY
+            }
+          }
+          .getOrDefault(false)
+      if (isKotlin) return true
+    }
+    return false
+  }
+
+  private fun hasCompanionMember(
+    psiClass: PsiClass,
+    memberName: String?,
+    context: PsiElement,
+  ): Boolean {
+    val classId = getClassId(psiClass) ?: return false
+    return runCatching {
+        analyze(KaModuleProvider.getInstance(context.project).getModule(context, null)) {
+          val symbol = findClass(classId) as? KaNamedClassSymbol ?: return@analyze false
+          val companion = symbol.companionObject ?: return@analyze false
+          if (memberName == null) {
+            true
+          } else {
+            companion.memberScope.callables(Name.identifier(memberName)).any()
+          }
+        }
+      }
+      .getOrDefault(false)
+  }
+
+  private fun isEventBusSubscriber(element: PsiElement?): Boolean {
+    if (element is PsiClass) {
+      if (element.annotations.any { it.isSubscribeAnno() }) return true
+      if (element.methods.any { m -> m.annotations.any { it.isSubscribeAnno() } }) return true
+    }
+    if (element is PsiMethod) {
+      if (element.annotations.any { it.isSubscribeAnno() }) return true
+    }
+    if (element is PsiField) {
+      val resolvedClass = (element.type as? PsiClassType)?.resolve()
+      if (resolvedClass != null && isEventBusSubscriber(resolvedClass)) return true
+    }
+    return false
+  }
+
+  private fun PsiAnnotation.isSubscribeAnno(): Boolean =
+    qualifiedName == "com.google.android.apps.gmm.systems.eventbus.Subscribe" ||
+      qualifiedName?.endsWith(".Subscribe") == true
+
   /**
    * Helper for [skipRecursive] that recursively marks nodes as [seen] and copies comments and
    * whitespace to [data].
@@ -276,6 +425,14 @@ private open class Psi2kTranslator(
     check(seen.putIfAbsent(element, translation) == null || element is PsiWhiteSpace) {
       "$element ${element.textRange} visited twice: ```${element.text}```"
     }
+  }
+
+  protected fun markSeenRecursive(element: PsiElement?) {
+    if (element == null) return
+    if (element !in seen) {
+      seen(element)
+    }
+    element.children().forEach { markSeenRecursive(it) }
   }
 
   /** Skips over [node] and its transitive children, preserving comments and whitespace. */
@@ -881,21 +1038,73 @@ private open class Psi2kTranslator(
     reference.children().forEach { child ->
       doAccept(child)
       if (child == reference.classReference) {
-        val targetClass = reference.classReference.resolve()
-        if (isTranslated(targetClass)) {
-          // If the referenced class is also being translated, rewrite
+        val targetClass = reference.classReference.resolve() as? PsiClass
+        if (
+          targetClass != null &&
+            (isTranslatedCompanionMember(targetClass, reference) ||
+              hasCompanionMember(targetClass, reference.referenceName, reference))
+        ) {
+          // If the referenced class is also being translated or has a companion object member,
+          // rewrite
           // import my.pkg.Foo.bar ==> import my.pkg.Foo.Companion.bar
-          // since we move static declarations into the companion object (see visitMethod etc.)
+          // since static declarations are in the companion object (see visitMethod etc.)
           data.append(".Companion")
         }
       }
     }
   }
 
+  private fun isTranslatedCompanionMember(
+    targetClass: PsiClass,
+    reference: PsiImportStaticReferenceElement,
+  ): Boolean {
+    if (!isTranslated(targetClass)) return false
+    val memberName = reference.referenceName ?: return false
+
+    val resolved = reference.resolve()
+    if (resolved is PsiEnumConstant) return false
+    if (resolved is PsiClass) return false
+    if (resolved is PsiMethod && isGeneratedEnumMethod(resolved)) return false
+
+    if (targetClass.isEnum) {
+      if (targetClass.findFieldByName(memberName, false) is PsiEnumConstant) return false
+      if (memberName == "values" || memberName == "valueOf") {
+        val methods = targetClass.findMethodsByName(memberName, false)
+        if (methods.isEmpty() || methods.any { isGeneratedEnumMethod(it) }) return false
+      }
+    }
+    if (targetClass.findInnerClassByName(memberName, false) != null) return false
+
+    return true
+  }
+
+  private fun isGeneratedEnumMethod(method: PsiMethod): Boolean {
+    val parent = (method.containingClass ?: method.parent as? PsiClass) ?: return false
+    return method.isStatic &&
+      parent.isEnum &&
+      ((method.name == "values" && !method.hasParameters()) ||
+        (method.name == "valueOf" &&
+          method.parameterList.parametersCount == 1 &&
+          method.parameterList.getParameter(0)?.type?.equalsToText("java.lang.String") == true))
+  }
+
   private fun isTranslated(element: PsiElement?): Boolean {
     // For now, consider elements defined in non-binary Java files translated, as that should mean
     // they're in the same module, but includes generated files which we may not want.
     return element?.language == JavaLanguage.INSTANCE && !element.containingFile.fileType.isBinary
+  }
+
+  override fun visitInstanceOfExpression(expression: PsiInstanceOfExpression) {
+    val needParens =
+      expression.textContains('\n') && expression.parent !is PsiParenthesizedExpression
+    if (needParens) {
+      seen(expression)
+      data.append("(")
+      expression.children().forEach { doAccept(it) }
+      data.append(")")
+    } else {
+      super.visitInstanceOfExpression(expression)
+    }
   }
 
   override fun visitJavaToken(token: PsiJavaToken) {
@@ -1030,14 +1239,44 @@ private open class Psi2kTranslator(
     seen(node)
 
     // Omit generated enum methods values(), valueOf("...")
-    if (
-      node.isStatic &&
-        (node.parent as? PsiClass)?.isEnum == true &&
-        ((node.name == "values" && !node.hasParameters()) ||
-          (node.name == "valueOf" &&
-            node.parameterList.parametersCount == 1 &&
-            node.parameterList.getParameter(0)!!.type.equalsToText("java.lang.String")))
-    ) {
+    if (isGeneratedEnumMethod(node)) {
+      return
+    }
+
+    val overriddenPropertyName = findOverriddenPropertyCached(node)
+    if (overriddenPropertyName != null) {
+      val matchingField = node.containingClass?.findFieldByName(overriddenPropertyName, false)
+      if (matchingField != null) {
+        markSeenRecursive(node)
+        return
+      }
+
+      companionIfStatic(node) {
+        node.children().forEach { child ->
+          when (child) {
+            node.modifierList -> {
+              doAccept(node.throwsList)
+              doAccept(child)
+              data.append(" val ")
+              data.append(overriddenPropertyName)
+            }
+            node.returnTypeElement -> visitTypeDeclaration(node.returnTypeElement)
+            node.body -> {
+              if (node.body != null) {
+                data.append("\n    get() ")
+                doAccept(node.body)
+              }
+            }
+            node.throwsList -> {}
+            node.nameIdentifier,
+            node.parameterList,
+            node.typeParameterList -> {
+              markSeenRecursive(child)
+            }
+            else -> seen(child)
+          }
+        }
+      }
       return
     }
 
@@ -1203,7 +1442,12 @@ private open class Psi2kTranslator(
     if (node.hasModifierProperty(PsiModifier.TRANSIENT)) data.append("@Transient ")
     if (node.hasModifierProperty(PsiModifier.VOLATILE)) data.append("@Volatile ")
     if (parent is PsiMethod && node.isStatic) data.append("@JvmStatic ")
-    if (parent is PsiField && parent !is PsiEnumConstant && !node.isPrivate) {
+    if (
+      parent is PsiField &&
+        parent !is PsiEnumConstant &&
+        !node.isPrivate &&
+        !isOverriddenPropertyField(parent)
+    ) {
       data.append("@JvmField ")
     }
 
@@ -1222,7 +1466,10 @@ private open class Psi2kTranslator(
             // Suppress `private` in private classes, which are accessible in Java but not Kotlin
             // TODO(kmb): consider only doing this if member is used from outside containing class
             JavaKeywords.PRIVATE ->
-              parent !is PsiMember || parent.containingClass?.isPrivate == false
+              (parent !is PsiMember || parent.containingClass?.isPrivate == false) &&
+                !(parent is PsiField && isOverriddenPropertyField(parent))
+            JavaKeywords.PROTECTED,
+            JavaKeywords.PUBLIC -> !(parent is PsiField && isOverriddenPropertyField(parent))
             else -> true
           }
         is PsiAnnotation -> {
@@ -1237,7 +1484,9 @@ private open class Psi2kTranslator(
     if (
       parent !is PsiParameter &&
         parent !is PsiLocalVariable &&
-        node.hasModifierProperty(PsiModifier.PACKAGE_LOCAL)
+        node.hasModifierProperty(PsiModifier.PACKAGE_LOCAL) &&
+        !(parent is PsiField && isOverriddenPropertyField(parent)) &&
+        !isEventBusSubscriber(parent)
     ) {
       data.append(" internal ")
     }
@@ -1251,7 +1500,13 @@ private open class Psi2kTranslator(
     ) {
       data.append(" open ")
     }
-    if (node.hasAnnotation(JAVA_LANG_OVERRIDE)) data.append(" override ")
+    if (
+      node.hasAnnotation(JAVA_LANG_OVERRIDE) ||
+        (parent is PsiMethod && findOverriddenPropertyCached(parent) != null) ||
+        (parent is PsiField && isOverriddenPropertyField(parent))
+    ) {
+      data.append(" override ")
+    }
     if (parent is PsiClass && parent.parent !is PsiFile && !node.isStatic) {
       data.append(" inner ")
     }
@@ -1564,7 +1819,18 @@ private open class Psi2kTranslator(
         }
       }
     } else {
-      super.visitReferenceElement(reference)
+      val qualification = getQualificationIfNeeded(reference)
+      if (qualification != null) {
+        seen(reference)
+        reference.children().replaceNotNull {
+          when {
+            it == reference.referenceNameElement -> qualification
+            else -> null
+          }
+        }
+      } else {
+        super.visitReferenceElement(reference)
+      }
     }
 
     // References can include (type) annotations as children, so see if we have a nullable type.
@@ -1574,27 +1840,96 @@ private open class Psi2kTranslator(
     }
   }
 
+  private fun getQualificationIfNeeded(reference: PsiJavaCodeReferenceElement): String? {
+    if (reference.qualifier != null) return null
+    if (reference.referenceNameElement == null) return null
+
+    val targetClass = reference.resolve() as? PsiClass ?: return null
+    if (targetClass is PsiTypeParameter) return null
+    val containingClass = targetClass.containingClass ?: return null
+
+    var current: PsiElement? = reference
+    while (current != null) {
+      if (current is PsiImportStatementBase || current is PsiPackageStatement) return null
+      if (current == containingClass) return null
+      current = current.parent
+    }
+
+    val javaFile = reference.containingFile as? PsiJavaFile
+    val importList = javaFile?.importList
+    val allImports = importList?.allImportStatements ?: emptyArray()
+    val targetQName = targetClass.qualifiedName
+    if (targetQName != null && allImports.isNotEmpty()) {
+      if (allImports.any { !it.isOnDemand && it.importReference?.qualifiedName == targetQName }) {
+        return null
+      }
+      val containingQName = containingClass.qualifiedName
+      if (
+        containingQName != null &&
+          allImports.any { it.isOnDemand && it.importReference?.qualifiedName == containingQName }
+      ) {
+        return null
+      }
+    }
+
+    val outermostClass = generateSequence(containingClass) { it.containingClass }.last()
+    val outermostQName = outermostClass.qualifiedName
+    val packageName = outermostQName?.substringBeforeLast('.', "") ?: ""
+    val outermostInScope =
+      reference.containingFile.isPackageDefaultImported(packageName) ||
+        allImports.any { !it.isOnDemand && it.importReference?.qualifiedName == outermostQName } ||
+        allImports.any { it.isOnDemand && it.importReference?.qualifiedName == packageName }
+
+    return if (outermostInScope) {
+      targetClass.getNameOfPossiblyInnerClass()
+    } else {
+      targetClass.qualifiedName ?: targetClass.getNameOfPossiblyInnerClass()
+    }
+  }
+
   override fun visitReferenceExpression(expression: PsiReferenceExpression) {
     // This in particular includes variable and method references
-    seen(expression)
-    expression
-      .children()
-      .filter { it != expression.parameterList }
-      .replaceNotNull {
-        when {
-          // Insert !! if qualifier is nullable. Note this is always consistent with the original
-          // code and kotlinc will generate warnings where unnecessary. But we only want to do this
-          // where needed to avoid adding !!s all over the place.
-          it.tokenOrNull() == "." && hasNullableValue(expression.qualifierExpression) -> "!!."
-          // <array>.length ==> <array>.size
-          it == expression.referenceNameElement &&
-            expression.referenceName == "length" &&
-            ((expression.qualifier as? PsiExpression)?.type?.arrayDimensions ?: 0) > 0 -> "size"
-          else -> null
-        }
+    if (expression.qualifierExpression == null) {
+      val qualification = getQualificationIfNeeded(expression)
+      if (qualification != null) {
+        expression.replaceWith(qualification)
+        return
       }
+    }
+    seen(expression)
+    val isKotlinObjectInstance = isKotlinObjectInstanceAccess(expression)
+    val needsBangBang = hasNullableValue(expression.qualifierExpression)
+    for (child in expression.children()) {
+      if (child == expression.parameterList) continue
+      if (isKotlinObjectInstance) {
+        if (child == expression.qualifierExpression) {
+          doAccept(child)
+        } else {
+          skipRecursive(child)
+        }
+        continue
+      }
+      when {
+        child == expression.qualifierExpression -> {
+          doAccept(child)
+          if (needsBangBang) {
+            data.append("!!")
+          }
+        }
+        child.tokenOrNull() == "." -> doAccept(child)
+        child == expression.referenceNameElement &&
+          expression.referenceName == "length" &&
+          ((expression.qualifier as? PsiExpression)?.type?.arrayDimensions ?: 0) > 0 ->
+          child.replaceWith("size")
+        else -> doAccept(child)
+      }
+    }
     // type parameters (skipped above) last if any: Foo.<Bar>baz(...) ==> Foo.baz<Bar>(...)
-    doAccept(expression.parameterList)
+    if (!isKotlinObjectInstance) {
+      doAccept(expression.parameterList)
+    } else {
+      expression.parameterList?.let { skipRecursive(it) }
+    }
   }
 
   override fun visitReferenceList(list: PsiReferenceList) {
