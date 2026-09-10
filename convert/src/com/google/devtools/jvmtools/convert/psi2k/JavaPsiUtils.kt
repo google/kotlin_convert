@@ -32,6 +32,9 @@ import com.intellij.psi.PsiVariable
 import com.intellij.psi.impl.JavaConstantExpressionEvaluator.computeConstantExpression
 import com.intellij.psi.util.PsiUtil
 import com.intellij.psi.util.parentOfType
+import org.jetbrains.kotlin.name.ClassId
+import org.jetbrains.kotlin.name.FqName
+import org.jetbrains.kotlin.name.Name
 
 val PsiModifierListOwner.isAbstract: Boolean
   get() = hasModifierProperty(PsiModifier.ABSTRACT)
@@ -80,10 +83,21 @@ internal fun PsiExpression.constantValue(): Any? =
 
 /** Get name of a class with all its outer class names */
 internal fun PsiClass.getNameOfPossiblyInnerClass(): String {
-  val outerName = (parent as? PsiClass)?.getNameOfPossiblyInnerClass()
+  val outerName = (containingClass ?: parent as? PsiClass)?.getNameOfPossiblyInnerClass()
   return if (outerName == null) {
     name ?: ""
   } else {
     "$outerName.$name"
+  }
+}
+
+/** Get ClassId for a PsiClass, taking into account inner/nested classes. */
+internal fun getClassId(psiClass: PsiClass): ClassId? {
+  val parent = psiClass.containingClass
+  return if (parent != null) {
+    getClassId(parent)?.createNestedClassId(Name.identifier(psiClass.name ?: return null))
+  } else {
+    val qName = psiClass.qualifiedName ?: return null
+    ClassId.topLevel(FqName(qName))
   }
 }
