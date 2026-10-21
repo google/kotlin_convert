@@ -16,6 +16,7 @@
 
 package com.google.devtools.jvmtools.convert.psi2k
 
+import com.android.tools.lint.detector.api.isKotlin
 import com.google.devtools.jvmtools.convert.util.runIf
 import com.google.devtools.jvmtools.analysis.CfgRoot
 import com.google.devtools.jvmtools.analysis.State
@@ -53,6 +54,7 @@ import com.intellij.psi.PsiCatchSection
 import com.intellij.psi.PsiClass
 import com.intellij.psi.PsiClassInitializer
 import com.intellij.psi.PsiClassObjectAccessExpression
+import com.intellij.psi.PsiClassOwner
 import com.intellij.psi.PsiClassType
 import com.intellij.psi.PsiCodeBlock
 import com.intellij.psi.PsiComment
@@ -131,8 +133,14 @@ import com.intellij.psi.util.TypeConversionUtil.isNumericType
 import com.intellij.psi.util.TypeConversionUtil.isPrimitiveAndNotNull
 import com.intellij.psi.util.TypeConversionUtil.isPrimitiveAndNotNullOrWrapper
 import com.intellij.psi.util.TypeConversionUtil.unboxAndBalanceTypes
+import org.jetbrains.kotlin.analysis.api.analyze
+import org.jetbrains.kotlin.analysis.api.projectStructure.KaModuleProvider
+import org.jetbrains.kotlin.analysis.api.symbols.KaNamedClassSymbol
 import org.jetbrains.kotlin.lexer.KtKeywordToken
 import org.jetbrains.kotlin.lexer.KtTokens
+import org.jetbrains.kotlin.name.ClassId
+import org.jetbrains.kotlin.name.FqName
+import org.jetbrains.kotlin.name.Name
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfType
 import org.jetbrains.kotlin.psi.psiUtil.getParentOfTypes2
 import org.jetbrains.uast.UElement
@@ -887,7 +895,80 @@ private open class Psi2kTranslator(
           // import my.pkg.Foo.bar ==> import my.pkg.Foo.Companion.bar
           // since we move static declarations into the companion object (see visitMethod etc.)
           data.append(".Companion")
+        } else {
+          // If the referenced class is a Kotlin class whose "static" member actually lives in its
+          // companion object (e.g., a @JvmStatic fun or @JvmField / const val), Kotlin requires
+          // the import to go through the companion, e.g.
+          // import my.pkg.Foo.bar ==> import my.pkg.Foo.Companion.bar
+          // (quoteIfNeeded is defensive: companion names can't be keywords, but every emitted
+          // identifier goes through it.)
+          kotlinCompanionNameForStaticImport(reference, targetClass as? PsiClass)?.let {
+            data.append("." + quoteIfNeeded(it))
+          }
         }
+      }
+    }
+  }
+
+  /**
+   * Returns the name of the companion object of the given Kotlin [targetClass] if [reference]
+   * imports a member of that companion object, or `null` otherwise (including if [targetClass]
+   * isn't a Kotlin class).
+   *
+   * Java can statically import companion members of Kotlin classes as if they were declared on the
+   * class itself (`import static my.pkg.Foo.bar;`), because the Kotlin compiler generates static
+   * forwarders on `Foo` for `@JvmStatic` functions and static fields for `@JvmField` / `const val`
+   * properties. Kotlin, however, only sees `bar` as a member of the companion object, so the
+   * translated import must name the companion: `import my.pkg.Foo.Companion.bar`.
+   *
+   * Not handled: on-demand imports (`import static Foo.*`), which don't reach this method, and
+   * static imports of companion property getters (`import static Foo.getBar`), which would also
+   * need to be renamed to the property name.
+   */
+  private fun kotlinCompanionNameForStaticImport(
+    reference: PsiImportStaticReferenceElement,
+    targetClass: PsiClass?,
+  ): String? {
+    if (targetClass == null) return null // unresolved import, leave as-is
+    // Simple name of the imported member, e.g., `bar` in `import static my.pkg.Foo.bar;`
+    val memberName = reference.referenceName ?: return null
+    // Only Kotlin classes can have companion objects; static imports from Java classes are already
+    // valid Kotlin. Kotlin sources in the same analysis report Kotlin as their language, while
+    // Kotlin classes in binary dependencies (the common case, e.g., Truth subjects in a testing
+    // library) look like Java classes to PSI but carry the @kotlin.Metadata annotation that the
+    // Kotlin compiler emits on every class (same check as MappedMethod.forCall).
+    if (!isKotlin(targetClass.language) && !targetClass.hasAnnotation("kotlin.Metadata")) {
+      return null
+    }
+    // The Analysis API identifies classes by package plus (possibly nested) relative class name,
+    // which can't be reliably derived from the dotted qualified name alone, so take the package
+    // from the containing file, e.g., my.pkg.Outer.Inner ==> (my.pkg, Outer.Inner).
+    val qualifiedName = targetClass.qualifiedName ?: return null
+    val packageName = (targetClass.containingFile as? PsiClassOwner)?.packageName ?: return null
+    val relativeName =
+      if (packageName.isEmpty()) qualifiedName else qualifiedName.removePrefix("$packageName.")
+    // Use the Kotlin Analysis API, which exposes Kotlin-only structure (companion objects and their
+    // members) that the Java PSI view of the class doesn't.
+    return analyze(KaModuleProvider.getInstance(reference.project).getModule(reference, null)) {
+      val klass =
+        findClass(ClassId(FqName(packageName), FqName(relativeName), isLocal = false))
+          as? KaNamedClassSymbol ?: return@analyze null
+      // No companion means there's nothing to rewrite. This includes `object` declarations, whose
+      // members are imported directly (`import my.pkg.Obj.bar`), and enums without a companion,
+      // whose entries are imported directly as well.
+      val companion = klass.companionObject ?: return@analyze null
+      // Only rewrite if the imported name is actually declared in the companion: a class with a
+      // companion can still have other statically importable members (e.g., enum entries).
+      // Callables cover functions and properties; classifiers cover (rare) classes nested in the
+      // companion.
+      val name = Name.identifier(memberName)
+      val scope = companion.memberScope
+      if (scope.callables(name).any() || scope.classifiers(name).any()) {
+        // "Companion" for `companion object { ... }`, but the declared name for named companions,
+        // e.g., "Factory" for `companion object Factory { ... }`.
+        companion.name.asString()
+      } else {
+        null
       }
     }
   }
