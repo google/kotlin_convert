@@ -871,11 +871,21 @@ private open class Psi2kTranslator(
 
   override fun visitImportStatement(statement: PsiImportStatement) {
     val import = statement.qualifiedName
-    if (MAPPED_TYPES.containsKey(import)) {
+    if (import != null && isRedundantImport(import, statement.isOnDemand)) {
       skipRecursive(statement)
     } else {
       super.visitImportStatement(statement)
     }
+  }
+
+  private fun isRedundantImport(import: String, isOnDemand: Boolean): Boolean {
+    if (import == "java.lang.Deprecated") return false
+    if (MAPPED_TYPES.containsKey(import)) return true
+    if (isOnDemand) return import == "java.lang"
+    if (import.startsWith("java.lang.") && import.indexOf('.', startIndex = 10) == -1) {
+      return true
+    }
+    return false
   }
 
   override fun visitImportStaticStatement(statement: PsiImportStaticStatement) {
@@ -1183,19 +1193,54 @@ private open class Psi2kTranslator(
       extension.encloseInParensIfNeeded()
       data.append(".")
     }
+    val enclosingClass = expression.getParentOfType<PsiClass>(strict = true)
+    val isTopLevelShadowed =
+      mappedMethod.type == MappingType.TOP_LEVEL &&
+        enclosingClass?.findMethodsByName(mappedMethod.kotlinName, /* checkBases= */ true)?.any {
+          member ->
+          member.containingClass != expression.resolveMethod()?.containingClass
+        } == true
+
+    val kotlinFunctionName =
+      if (isTopLevelShadowed) {
+        when (mappedMethod.kotlinName) {
+          "checkNotNull",
+          "require",
+          "check" -> "kotlin.${mappedMethod.kotlinName}"
+          "mutableListOf",
+          "mutableSetOf",
+          "mutableMapOf",
+          "emptyList",
+          "emptySet",
+          "emptyMap",
+          "listOf",
+          "setOf" -> "kotlin.collections.${mappedMethod.kotlinName}"
+          "maxOf",
+          "minOf" -> "kotlin.comparisons.${mappedMethod.kotlinName}"
+          else -> "kotlin.${mappedMethod.kotlinName}"
+        }
+      } else {
+        mappedMethod.kotlinName
+      }
+
     seen(expression)
     expression.children().forEach { child ->
       if (child == expression.methodExpression) {
         seen(child)
         for (methodElement in child.children()) {
           when {
+            mappedMethod.type == MappingType.TOP_LEVEL &&
+              methodElement == expression.methodExpression.qualifierExpression ->
+              skipRecursive(methodElement)
+            mappedMethod.type == MappingType.TOP_LEVEL && methodElement.tokenOrNull() == "." ->
+              seen(methodElement)
             // Insert `!!` before `.` if the qualifier expression is nullable, for consistency with
             // visitReferenceExpression
             methodElement.tokenOrNull() == "." &&
               hasNullableValue(expression.methodExpression.qualifierExpression) ->
               methodElement.replaceWith("!!.")
             methodElement == expression.methodExpression.referenceNameElement ->
-              methodElement.replaceWith(mappedMethod.kotlinName)
+              methodElement.replaceWith(kotlinFunctionName)
             extension != null && methodElement == expression.methodExpression.qualifierExpression ->
               extension.encloseInParensIfNeeded { methodElement.replaceWith(extension) }
             else -> doAccept(methodElement)
@@ -2250,15 +2295,21 @@ private open class Psi2kTranslator(
         // go/keep-sorted start
         "java.lang.Boolean" to "Boolean",
         "java.lang.Byte" to "Byte",
+        "java.lang.CharSequence" to "CharSequence",
         "java.lang.Character" to "Char",
+        "java.lang.Cloneable" to "Cloneable",
+        "java.lang.Comparable" to "Comparable",
         "java.lang.Deprecated" to "java.lang.Deprecated", // Kotlin's @Deprecated requires message
         "java.lang.Double" to "Double",
         "java.lang.Float" to "Float",
         "java.lang.Integer" to "Int",
         "java.lang.Iterable" to "Iterable",
         "java.lang.Long" to "Long",
+        "java.lang.Number" to "Number",
         "java.lang.Object" to "Any",
         "java.lang.Short" to "Short",
+        "java.lang.String" to "String",
+        "java.lang.Throwable" to "Throwable",
         "java.util.Collection" to "MutableCollection",
         "java.util.Iterator" to "Iterator",
         "java.util.List" to "MutableList",
