@@ -87,6 +87,13 @@ private constructor(
   /** Returns the set of nodes that follow the given [node] in this [Cfg]. */
   fun successors(node: UElement): Collection<UElement> = forwardEdges[node]
 
+  /** Returns the nodes that follow [node] along normal (non-exceptional) control-flow edges. */
+  fun normalSuccessors(node: UElement): List<UElement> =
+    forwardEdges[node].filter { dest ->
+      val label = edgeConditions(node, dest)
+      label !is CfgEdgeLabel.CfgExceptionalEdge || null in label.thrown
+    }
+
   /**
    * Returns a map from [successors] of the given [node] to the labels attached to the connecting
    * edges, if any.

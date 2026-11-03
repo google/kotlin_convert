@@ -17,6 +17,7 @@
 package com.google.devtools.jvmtools.analysis.nullness
 
 import com.google.devtools.jvmtools.convert.util.runIf
+import com.google.devtools.jvmtools.analysis.Cfg
 import com.google.devtools.jvmtools.analysis.CfgForeachIteratedExpression
 import com.google.devtools.jvmtools.analysis.CfgRoot
 import com.google.devtools.jvmtools.analysis.CfgSwitchBranchExpression
@@ -30,18 +31,26 @@ import com.google.devtools.jvmtools.analysis.UDataflowResult
 import com.google.devtools.jvmtools.analysis.UInterproceduralAnalysisContext
 import com.google.devtools.jvmtools.analysis.UTransferFunction
 import com.intellij.lang.java.JavaLanguage
+import com.intellij.psi.LambdaUtil
+import com.intellij.psi.PsiAnonymousClass
 import com.intellij.psi.PsiArrayType
+import com.intellij.psi.PsiCall
 import com.intellij.psi.PsiClass
 import com.intellij.psi.PsiClassType
+import com.intellij.psi.PsiCompiledElement
 import com.intellij.psi.PsiField
+import com.intellij.psi.PsiLambdaExpression
 import com.intellij.psi.PsiLocalVariable
+import com.intellij.psi.PsiMethod
 import com.intellij.psi.PsiModifier
 import com.intellij.psi.PsiModifierListOwner
 import com.intellij.psi.PsiParameter
+import com.intellij.psi.PsiPrimitiveType
 import com.intellij.psi.PsiType
 import com.intellij.psi.PsiTypeParameter
 import com.intellij.psi.PsiTypes
 import com.intellij.psi.PsiVariable
+import com.intellij.psi.util.InheritanceUtil
 import com.intellij.psi.util.PsiUtil.extractIterableTypeParameter
 import org.jetbrains.uast.UArrayAccessExpression
 import org.jetbrains.uast.UBinaryExpression
@@ -52,6 +61,7 @@ import org.jetbrains.uast.UClass
 import org.jetbrains.uast.UClassLiteralExpression
 import org.jetbrains.uast.UElement
 import org.jetbrains.uast.UExpression
+import org.jetbrains.uast.UField
 import org.jetbrains.uast.UFile
 import org.jetbrains.uast.UForEachExpression
 import org.jetbrains.uast.UIfExpression
@@ -65,6 +75,7 @@ import org.jetbrains.uast.UParenthesizedExpression
 import org.jetbrains.uast.UPolyadicExpression
 import org.jetbrains.uast.UQualifiedReferenceExpression
 import org.jetbrains.uast.UReferenceExpression
+import org.jetbrains.uast.UReturnExpression
 import org.jetbrains.uast.USimpleNameReferenceExpression
 import org.jetbrains.uast.USuperExpression
 import org.jetbrains.uast.UThisExpression
@@ -73,9 +84,11 @@ import org.jetbrains.uast.UastBinaryExpressionWithTypeKind
 import org.jetbrains.uast.UastBinaryOperator
 import org.jetbrains.uast.UastCallKind
 import org.jetbrains.uast.UastPrefixOperator
+import org.jetbrains.uast.getParameterForArgument
 import org.jetbrains.uast.getParentOfType
 import org.jetbrains.uast.internal.acceptList
 import org.jetbrains.uast.resolveToUElementOfType
+import org.jetbrains.uast.toUElementOfType
 import org.jetbrains.uast.visitor.AbstractUastVisitor
 import org.jetbrains.uast.visitor.UastTypedVisitor
 
@@ -90,7 +103,7 @@ object NullnessAnalysis {
           ctx.dataflowResult(CfgRoot.of(lambda)).finalResult
 
         NullnessTransfer(
-          root = ctx.analysisKey.callee.rootNode,
+          cfgRoot = ctx.analysisKey.callee,
           analyzeLambda = ::analyzeLambda,
           analyzeCallee = callee@{ call, state ->
               val callee = call.resolveToUElementOfType<UMethod>() ?: return@callee null
@@ -282,8 +295,8 @@ object NullnessAnalysis {
 
 /** Transfer function for tracking reference [Nullness] similar to how Kotlin would. */
 private class NullnessTransfer(
-  /** The root node of what's being analyzed, i.e., a [CfgRoot.rootNode]. */
-  private val root: UElement,
+  /** The [CfgRoot] of what's being analyzed. */
+  private val cfgRoot: CfgRoot,
   /** Produces interprocedural analysis result of the given lambda as needed by [resultNullness]. */
   private val analyzeLambda: (ULambdaExpression) -> State<Nullness>,
   /**
@@ -292,6 +305,33 @@ private class NullnessTransfer(
    */
   private val analyzeCallee: (UCallExpression, State<Nullness>) -> Nullness?,
 ) : UTransferFunction<State<Nullness>> {
+  private val root: UElement
+    get() = cfgRoot.rootNode
+
+  private val cfg: Cfg by lazy { Cfg.create(cfgRoot) }
+  private val otherCfgs = HashMap<UElement, Cfg>()
+
+  private fun cfgForMethod(uMethod: UMethod): Cfg =
+    if (uMethod == root) {
+      cfg
+    } else {
+      otherCfgs.getOrPut(uMethod) { Cfg.create(CfgRoot.of(uMethod)) }
+    }
+
+  private fun enclosingCfg(node: UElement): Cfg? {
+    val enclosing =
+      node.getParentOfType(strict = true, UMethod::class.java, ULambdaExpression::class.java)
+        ?: return null
+    if (enclosing == root) return cfg
+    return otherCfgs.getOrPut(enclosing) {
+      when (enclosing) {
+        is UMethod -> Cfg.create(CfgRoot.of(enclosing))
+        is ULambdaExpression -> Cfg.create(CfgRoot.of(enclosing))
+        else -> error("Unexpected CFG root: $enclosing")
+      }
+    }
+  }
+
   override val bottom: State<Nullness>
     get() = NullnessAnalysis.BOTTOM
 
@@ -414,28 +454,74 @@ private class NullnessTransfer(
     }
   }
 
-  override fun visitBinaryExpressionWithType(
-    node: UBinaryExpressionWithType,
+  override fun visitParenthesizedExpression(
+    node: UParenthesizedExpression,
     data: TransferInput<State<Nullness>>,
-  ): TransferResult<State<Nullness>> {
-    return if (node.operationKind == UastBinaryExpressionWithTypeKind.InstanceCheck.INSTANCE) {
-      // `instanceof` can only be `true` for non-null values
+  ): TransferResult<State<Nullness>> =
+    if (data.isConditional) {
+      val trueState = data.value(condition = true)
+      val falseState = data.value(condition = false)
       TransferResult.conditional(
         trueValue =
           State(
-            data.value(condition = true).value.withMapping(node, Nullness.NONULL),
-            data.value(condition = true).store +
-              listOfNotNull(node.operand.resolveTrackedVariable()?.let { it to Nullness.NONULL }),
+            trueState.value.withMapping(node, trueState.valueOrBottom(node.expression)),
+            trueState.store,
           ),
         falseValue =
           State(
-            data.value(condition = false).value.withMapping(node, Nullness.NONULL),
-            data.value(condition = false).store,
+            falseState.value.withMapping(node, falseState.valueOrBottom(node.expression)),
+            falseState.store,
           ),
         exceptionalValues = mapOf(throwableType to data.value()),
       )
     } else {
-      super.visitBinaryExpressionWithType(node, data)
+      val state = data.value()
+      state.toNormalResult(node, state.valueOrBottom(node.expression))
+    }
+
+  override fun visitBinaryExpressionWithType(
+    node: UBinaryExpressionWithType,
+    data: TransferInput<State<Nullness>>,
+  ): TransferResult<State<Nullness>> {
+    return when {
+      node.operationKind == UastBinaryExpressionWithTypeKind.InstanceCheck.INSTANCE ->
+        // `instanceof` can only be `true` for non-null values
+        TransferResult.conditional(
+          trueValue =
+            State(
+              data.value(condition = true).value.withMapping(node, Nullness.NONULL),
+              data.value(condition = true).store +
+                listOfNotNull(node.operand.resolveTrackedVariable()?.let { it to Nullness.NONULL }),
+            ),
+          falseValue =
+            State(
+              data.value(condition = false).value.withMapping(node, Nullness.NONULL),
+              data.value(condition = false).store,
+            ),
+          exceptionalValues = mapOf(throwableType to data.value()),
+        )
+      node.operationKind is UastBinaryExpressionWithTypeKind.TypeCast -> {
+        val state = data.value()
+        val value =
+          if (node.type is PsiPrimitiveType) {
+            Nullness.NONULL
+          } else {
+            val operandNullness = state.valueOrBottom(node.operand)
+            val castTypeNullness = nullnessFromAnnotation(node.type)
+            when {
+              castTypeNullness == Nullness.NULLABLE -> Nullness.NULLABLE
+              indicatesNonNull(node.type) -> Nullness.NONULL
+              operandNullness != Nullness.BOTTOM -> operandNullness
+              else -> castTypeNullness
+            }
+          }
+        state.toNormalResult(
+          node,
+          value,
+          dereference = runIf(node.type is PsiPrimitiveType) { node.operand },
+        )
+      }
+      else -> super.visitBinaryExpressionWithType(node, data)
     }
   }
 
@@ -563,11 +649,308 @@ private class NullnessTransfer(
     val state = data.value()
     val value =
       analyzeCallee(node, state)
+        ?: demandDrivenStrictAndroidStubNullness(node)
         ?: node.resultNullness(state, analyzeLambda)
         ?: nullnessFromAnnotation(node.getExpressionType(), node.resolve())
     // TODO(b/308816245): havoc fields once we track them
     return state.toNormalResult(node, value, dereference = node.receiver)
   }
+
+  /**
+   * Treats unannotated Android SDK lookup calls as [Nullness.NULLABLE] only when a downstream null
+   * check, nullable wrapper, `@Nullable` contract, or private helper demands nullability, keeping
+   * unguarded view-inflation bindings and unannotated fields non-null.
+   */
+  private fun demandDrivenStrictAndroidStubNullness(node: UCallExpression): Nullness? {
+    val callee = node.resolve() ?: return null
+    if (!isStrictAndroidStubMethod(callee)) return null
+    return runIf(expressionHasDownstreamNullDemand(node)) { Nullness.NULLABLE }
+  }
+
+  private fun expressionHasDownstreamNullDemand(
+    exprNode: UExpression,
+    visitedVars: Set<PsiVariable> = emptySet(),
+    visitedMethods: Set<PsiMethod> = emptySet(),
+  ): Boolean {
+    var topExpr: UExpression = exprNode
+    while (true) {
+      val parent = topExpr.uastParent
+      topExpr =
+        when {
+          parent is UQualifiedReferenceExpression && parent.selector == topExpr -> parent
+          parent is UParenthesizedExpression -> parent
+          parent is UBinaryExpressionWithType &&
+            parent.operationKind is UastBinaryExpressionWithTypeKind.TypeCast &&
+            parent.type !is PsiPrimitiveType &&
+            !indicatesNonNull(parent.type) -> parent
+          parent is UIfExpression &&
+            parent.isTernary &&
+            (parent.thenExpression == topExpr || parent.elseExpression == topExpr) -> parent
+          else -> break
+        }
+    }
+
+    val consumer = topExpr.uastParent
+    if (isDirectNullCheckParent(topExpr, consumer)) {
+      return true
+    }
+    if (consumer is UCallExpression) {
+      val callee = consumer.resolve()
+      val param = consumer.getParameterForArgument(topExpr)
+      if (callee != null && param != null && !param.isVarArgs && !isExplicitlyNonNull(param)) {
+        val psiCall =
+          (consumer.sourcePsi as? PsiCall)
+            ?: ((consumer.sourcePsi?.parent as? PsiAnonymousClass)?.parent as? PsiCall)
+        val substitutedParamType =
+          psiCall?.resolveMethodGenerics()?.substitutor?.substitute(param.type)
+        if (
+          hasNullableAnno(param) ||
+            indicatesNullable(param.typeElement) ||
+            indicatesNullable(param.type) ||
+            indicatesNullable(substitutedParamType)
+        ) {
+          return true
+        }
+        if (
+          isAnalyzablePrivateMethod(callee) && callee !in visitedMethods && param !in visitedVars
+        ) {
+          val uCallee = callee.toUElementOfType<UMethod>()
+          if (uCallee != null && uCallee.uastBody != null) {
+            val calleeCfg = cfgForMethod(uCallee)
+            if (
+              hasReachableNullDemandFromCfgWorklist(
+                targetCfg = calleeCfg,
+                initialNodes = listOf(calleeCfg.entryNode),
+                targetVar = param,
+                visitedVars = visitedVars + param,
+                visitedMethods = visitedMethods + callee,
+              )
+            ) {
+              return true
+            }
+          }
+        }
+      }
+    }
+    if (consumer is ULocalVariable && consumer.uastInitializer == topExpr) {
+      @Suppress("DEPRECATION") val targetVar: PsiLocalVariable = consumer.psi
+      if (isExplicitlyNonNull(targetVar) || targetVar in visitedVars) {
+        return false
+      }
+      return hasNullableAnno(targetVar) ||
+        indicatesNullable(targetVar.typeElement) ||
+        indicatesNullable(targetVar.type) ||
+        hasReachableNullDemandInCfg(
+          startNode = consumer,
+          targetVar = targetVar,
+          visitedVars = visitedVars + targetVar,
+          visitedMethods = visitedMethods,
+        )
+    }
+    if (consumer is UField && consumer.uastInitializer == topExpr) {
+      val psiField = consumer.javaPsi as? PsiField ?: return false
+      if (isExplicitlyNonNull(psiField)) {
+        return false
+      }
+      return hasNullableAnno(psiField) ||
+        indicatesNullable(psiField.typeElement) ||
+        indicatesNullable(psiField.type)
+    }
+    if (consumer is ULambdaExpression && consumer.body == topExpr) {
+      return lambdaAcceptsNullableReturn(consumer)
+    }
+    if (consumer is UReturnExpression && consumer.returnExpression == topExpr) {
+      val callable = consumer.jumpTarget ?: enclosingCallable(exprNode) ?: return false
+      if (callable is ULambdaExpression) {
+        return lambdaAcceptsNullableReturn(callable)
+      }
+      val targetMethod = callable as? UMethod ?: return false
+      val psiMethod = targetMethod.javaPsi
+      if (isExplicitlyNonNullReturn(psiMethod)) {
+        return false
+      }
+      if (
+        hasNullableAnno(psiMethod) ||
+          indicatesNullable(psiMethod.returnTypeElement) ||
+          indicatesNullable(psiMethod.returnType) ||
+          overridesNullableReturn(psiMethod)
+      ) {
+        return true
+      }
+      if (isAnalyzablePrivateMethod(psiMethod) && psiMethod !in visitedMethods) {
+        val enclosingClass = topLevelUClass(exprNode) ?: return false
+        var callerChecksNull = false
+        enclosingClass.accept(
+          object : AbstractUastVisitor() {
+            override fun visitElement(node: UElement): Boolean = callerChecksNull
+
+            override fun visitCallExpression(node: UCallExpression): Boolean {
+              if (callerChecksNull) return true
+              if (
+                node.resolve() == psiMethod &&
+                  expressionHasDownstreamNullDemand(node, visitedVars, visitedMethods + psiMethod)
+              ) {
+                callerChecksNull = true
+                return true
+              }
+              return super.visitCallExpression(node)
+            }
+          }
+        )
+        return callerChecksNull
+      }
+      return false
+    }
+    if (
+      consumer is UPolyadicExpression &&
+        consumer.operator == UastBinaryOperator.ASSIGN &&
+        consumer.operands.lastOrNull() == topExpr
+    ) {
+      var assignTop: UExpression = consumer
+      while (assignTop.uastParent is UParenthesizedExpression) {
+        assignTop = assignTop.uastParent as UParenthesizedExpression
+      }
+      if (isDirectNullCheckParent(assignTop, assignTop.uastParent)) {
+        return true
+      }
+      val lhsOperands = consumer.operands.dropLast(1)
+      if (
+        lhsOperands
+          .mapNotNull { it.resolveTrackedVariable() }
+          .filterNot { isExplicitlyNonNull(it) || it in visitedVars }
+          .any {
+            hasNullableAnno(it) ||
+              indicatesNullable(it.typeElement) ||
+              indicatesNullable(it.type) ||
+              hasReachableNullDemandInCfg(
+                startNode = consumer,
+                targetVar = it,
+                visitedVars = visitedVars + it,
+                visitedMethods = visitedMethods,
+              )
+          }
+      ) {
+        return true
+      }
+      return lhsOperands
+        .mapNotNull { (it as? UReferenceExpression)?.resolve() as? PsiField }
+        .filterNot { isExplicitlyNonNull(it) }
+        .any { psiField ->
+          hasNullableAnno(psiField) ||
+            indicatesNullable(psiField.typeElement) ||
+            indicatesNullable(psiField.type)
+        }
+    }
+    return false
+  }
+
+  private fun enclosingCallable(node: UElement): UElement? {
+    var curr = node.uastParent
+    while (curr != null) {
+      if (curr is UMethod || curr is ULambdaExpression) {
+        return curr
+      }
+      curr = curr.uastParent
+    }
+    return null
+  }
+
+  private fun lambdaAcceptsNullableReturn(lambda: ULambdaExpression): Boolean {
+    val psiLambda = lambda.sourcePsi as? PsiLambdaExpression ?: return false
+    val sam =
+      LambdaUtil.getFunctionalInterfaceMethod(psiLambda.functionalInterfaceType) ?: return false
+    val substitutedReturnType = LambdaUtil.getFunctionalInterfaceReturnType(psiLambda)
+    return hasNullableAnno(sam) ||
+      indicatesNullable(sam.returnTypeElement) ||
+      indicatesNullable(sam.returnType) ||
+      indicatesNullable(substitutedReturnType)
+  }
+
+  private fun hasReachableNullDemandInCfg(
+    startNode: UElement,
+    targetVar: PsiVariable,
+    visitedVars: Set<PsiVariable>,
+    visitedMethods: Set<PsiMethod>,
+  ): Boolean {
+    val targetCfg = enclosingCfg(startNode) ?: return false
+    return hasReachableNullDemandFromCfgWorklist(
+      targetCfg = targetCfg,
+      initialNodes = targetCfg.normalSuccessors(startNode),
+      targetVar = targetVar,
+      visitedVars = visitedVars,
+      visitedMethods = visitedMethods,
+    )
+  }
+
+  private fun hasReachableNullDemandFromCfgWorklist(
+    targetCfg: Cfg,
+    initialNodes: Collection<UElement>,
+    targetVar: PsiVariable,
+    visitedVars: Set<PsiVariable>,
+    visitedMethods: Set<PsiMethod>,
+  ): Boolean {
+    val visited = HashSet<UElement>()
+    val worklist = ArrayDeque<UElement>(initialNodes)
+    while (worklist.isNotEmpty()) {
+      val curr = worklist.removeFirst()
+      if (!visited.add(curr)) continue
+      if (nodeDemandsVariableNullable(curr, targetVar, visitedVars, visitedMethods)) {
+        return true
+      }
+      val overwritesTarget =
+        curr is UPolyadicExpression &&
+          curr.operator == UastBinaryOperator.ASSIGN &&
+          curr.operands.dropLast(1).any { it.resolveTrackedVariable() == targetVar }
+      if (!overwritesTarget && !nodeDereferencesVariable(curr, targetVar)) {
+        worklist.addAll(targetCfg.normalSuccessors(curr))
+      }
+    }
+    return false
+  }
+
+  private fun nodeDemandsVariableNullable(
+    node: UElement,
+    targetVar: PsiVariable,
+    visitedVars: Set<PsiVariable>,
+    visitedMethods: Set<PsiMethod>,
+  ): Boolean =
+    when {
+      node is UReferenceExpression && node.resolve() == targetVar ->
+        expressionHasDownstreamNullDemand(node, visitedVars, visitedMethods)
+      node is UBinaryExpression &&
+        (node.operator == UastBinaryOperator.IDENTITY_EQUALS ||
+          node.operator == UastBinaryOperator.IDENTITY_NOT_EQUALS) ->
+        (node.leftOperand.isNullLiteral() &&
+          node.rightOperand.unwrappedTrackedVariable() == targetVar) ||
+          (node.rightOperand.isNullLiteral() &&
+            node.leftOperand.unwrappedTrackedVariable() == targetVar)
+      node is UCallExpression && isNullAwareHelperCall(node) ->
+        node.valueArguments.singleOrNull()?.unwrappedTrackedVariable() == targetVar
+      node is ULambdaExpression || node is UObjectLiteralExpression -> {
+        var found = false
+        node.accept(
+          object : AbstractUastVisitor() {
+            override fun visitElement(node: UElement): Boolean = found
+
+            override fun visitSimpleNameReferenceExpression(
+              node: USimpleNameReferenceExpression
+            ): Boolean {
+              if (found) return true
+              if (
+                node.resolve() == targetVar &&
+                  expressionHasDownstreamNullDemand(node, visitedVars, visitedMethods)
+              ) {
+                found = true
+                return true
+              }
+              return super.visitSimpleNameReferenceExpression(node)
+            }
+          }
+        )
+        found
+      }
+      else -> false
+    }
 
   override fun visitQualifiedReferenceExpression(
     node: UQualifiedReferenceExpression,
@@ -639,6 +1022,87 @@ private class NullnessTransfer(
       value[expression] ?: Nullness.BOTTOM
 
     fun UExpression.resolveTrackedVariable(): PsiVariable? = accept(ResolveTrackedVariable, Unit)
+
+    fun UExpression.isNullLiteral(): Boolean =
+      when (this) {
+        is ULiteralExpression -> isNull
+        is UParenthesizedExpression -> expression.isNullLiteral()
+        else -> false
+      }
+
+    fun isNullAwareHelperCall(call: UCallExpression): Boolean {
+      if (call.valueArgumentCount != 1) return false
+      val callee = call.resolve() ?: return false
+      return isNullAwareHelperMethod(callee)
+    }
+
+    fun isDirectNullCheckParent(expr: UExpression, parent: UElement?): Boolean =
+      when {
+        parent is UBinaryExpression &&
+          (parent.operator == UastBinaryOperator.IDENTITY_EQUALS ||
+            parent.operator == UastBinaryOperator.IDENTITY_NOT_EQUALS) -> {
+          val other = if (parent.leftOperand == expr) parent.rightOperand else parent.leftOperand
+          other.isNullLiteral()
+        }
+        parent is UCallExpression && isNullAwareHelperCall(parent) ->
+          parent.valueArguments.singleOrNull() == expr
+        else -> false
+      }
+
+    fun UExpression.unwrappedTrackedVariable(): PsiVariable? =
+      when (this) {
+        is UParenthesizedExpression -> expression.unwrappedTrackedVariable()
+        is UBinaryExpressionWithType ->
+          if (
+            operationKind is UastBinaryExpressionWithTypeKind.TypeCast &&
+              type !is PsiPrimitiveType &&
+              nullnessFromAnnotation(type) != Nullness.NULLABLE
+          ) {
+            operand.unwrappedTrackedVariable()
+          } else {
+            null
+          }
+        else -> resolveTrackedVariable()
+      }
+
+    fun nodeDereferencesVariable(node: UElement, targetVar: PsiVariable): Boolean =
+      when {
+        node is UArrayAccessExpression -> node.receiver.unwrappedTrackedVariable() == targetVar
+        node is UCallExpression ->
+          node.receiver?.unwrappedTrackedVariable() == targetVar ||
+            node.valueArguments.any { arg ->
+              arg.unwrappedTrackedVariable() == targetVar &&
+                node.getParameterForArgument(arg)?.let(::requiresNonNullArgument) == true
+            }
+        node is UQualifiedReferenceExpression && node.selector !is UCallExpression ->
+          node.receiver.unwrappedTrackedVariable() == targetVar
+        node is UCallableReferenceExpression ->
+          node.qualifierExpression?.unwrappedTrackedVariable() == targetVar
+        node is UBinaryExpressionWithType &&
+          node.operationKind is UastBinaryExpressionWithTypeKind.TypeCast &&
+          node.type is PsiPrimitiveType -> node.operand.unwrappedTrackedVariable() == targetVar
+        node is CfgForeachIteratedExpression ->
+          node.wrappedExpression.unwrappedTrackedVariable() == targetVar
+        node is CfgSwitchBranchExpression ->
+          node.wrappedExpression.unwrappedTrackedVariable() == targetVar
+        else -> false
+      }
+
+    fun requiresNonNullArgument(param: PsiParameter): Boolean =
+      isExplicitlyNonNull(param) ||
+        (param.isInNullMarkedScope() &&
+          !hasNullableAnno(param) &&
+          !indicatesNullable(param.typeElement) &&
+          !indicatesNullable(param.type))
+
+    fun topLevelUClass(node: UElement): UClass? {
+      var curr = node.getParentOfType<UClass>()
+      while (true) {
+        val outer = curr?.getParentOfType<UClass>() ?: break
+        curr = outer
+      }
+      return curr
+    }
   }
 
   private object ResolveTrackedVariable : UastTypedVisitor<Unit, PsiVariable?> {
@@ -662,5 +1126,78 @@ private class NullnessTransfer(
             node.rightOperand.resolveTrackedVariable()
           }
       }
+  }
+}
+
+private fun isExplicitlyNonNull(variable: PsiVariable): Boolean =
+  indicatesNonNull(variable.modifierList, useTypeAnnos = variable.type !is PsiArrayType) ||
+    indicatesNonNull(variable.typeElement) ||
+    indicatesNonNull(variable.type)
+
+private fun isAnalyzablePrivateMethod(psiMethod: PsiMethod): Boolean =
+  psiMethod !is PsiCompiledElement &&
+    !psiMethod.isConstructor &&
+    psiMethod.hasModifierProperty(PsiModifier.PRIVATE) &&
+    !psiMethod.hasTypeParameters() &&
+    psiMethod.parameterList.parameters.none {
+      (it.type as? PsiClassType)?.resolve() is PsiTypeParameter
+    }
+
+private fun PsiClass?.isInheritorOrSelf(fqn: String): Boolean =
+  this != null && (qualifiedName == fqn || InheritanceUtil.isInheritor(this, fqn))
+
+fun isStrictAndroidStubMethod(callee: PsiMethod): Boolean {
+  if (
+    callee.returnType is PsiPrimitiveType ||
+      !callee.isJavaDeclaration() ||
+      isExplicitlyNonNullReturn(callee) ||
+      (callee.isInNullMarkedScope() &&
+        !hasNullableAnno(callee) &&
+        !indicatesNullable(callee.returnTypeElement) &&
+        !indicatesNullable(callee.returnType))
+  ) {
+    return false
+  }
+  val paramCount = callee.parameterList.parametersCount
+  val owner = callee.containingClass ?: return false
+  return when (callee.name) {
+    "findViewById" ->
+      paramCount == 1 &&
+        (owner.isInheritorOrSelf("android.view.View") ||
+          owner.isInheritorOrSelf("android.view.Window") ||
+          owner.isInheritorOrSelf("android.app.Activity") ||
+          owner.isInheritorOrSelf("android.app.Dialog"))
+    "findViewWithTag" -> paramCount == 1 && owner.isInheritorOrSelf("android.view.View")
+    "getParent" ->
+      paramCount == 0 &&
+        (owner.isInheritorOrSelf("android.view.View") ||
+          owner.isInheritorOrSelf("android.app.Activity"))
+    "getLayoutParams" -> paramCount == 0 && owner.isInheritorOrSelf("android.view.View")
+    "getTag" ->
+      (paramCount in 0..1 && owner.isInheritorOrSelf("android.view.View")) ||
+        (paramCount == 0 &&
+          (owner.isInheritorOrSelf("android.app.Fragment") ||
+            owner.isInheritorOrSelf("androidx.fragment.app.Fragment") ||
+            owner.isInheritorOrSelf("android.support.v4.app.Fragment")))
+    "findFragmentById",
+    "findFragmentByTag" ->
+      paramCount == 1 &&
+        (owner.isInheritorOrSelf("android.app.FragmentManager") ||
+          owner.isInheritorOrSelf("androidx.fragment.app.FragmentManager") ||
+          owner.isInheritorOrSelf("android.support.v4.app.FragmentManager"))
+    "getSystemService" -> paramCount == 1 && owner.isInheritorOrSelf("android.content.Context")
+    "getDrawable" ->
+      (paramCount in 1..2 &&
+        (owner.isInheritorOrSelf("android.content.res.Resources") ||
+          owner.isInheritorOrSelf("android.content.Context"))) ||
+        (paramCount == 0 && owner.isInheritorOrSelf("android.widget.ImageView"))
+    "getString" ->
+      paramCount == 1 &&
+        (owner.isInheritorOrSelf("android.database.Cursor") ||
+          owner.isInheritorOrSelf("android.os.BaseBundle") ||
+          owner.isInheritorOrSelf("android.os.Bundle"))
+    "getStringExtra" -> paramCount == 1 && owner.isInheritorOrSelf("android.content.Intent")
+    "getExtras" -> paramCount == 0 && owner.isInheritorOrSelf("android.content.Intent")
+    else -> false
   }
 }
