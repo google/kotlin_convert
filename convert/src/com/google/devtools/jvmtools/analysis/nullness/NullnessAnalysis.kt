@@ -38,6 +38,7 @@ import com.intellij.psi.PsiLocalVariable
 import com.intellij.psi.PsiModifier
 import com.intellij.psi.PsiModifierListOwner
 import com.intellij.psi.PsiParameter
+import com.intellij.psi.PsiPrimitiveType
 import com.intellij.psi.PsiType
 import com.intellij.psi.PsiTypeParameter
 import com.intellij.psi.PsiTypes
@@ -414,28 +415,74 @@ private class NullnessTransfer(
     }
   }
 
-  override fun visitBinaryExpressionWithType(
-    node: UBinaryExpressionWithType,
+  override fun visitParenthesizedExpression(
+    node: UParenthesizedExpression,
     data: TransferInput<State<Nullness>>,
-  ): TransferResult<State<Nullness>> {
-    return if (node.operationKind == UastBinaryExpressionWithTypeKind.InstanceCheck.INSTANCE) {
-      // `instanceof` can only be `true` for non-null values
+  ): TransferResult<State<Nullness>> =
+    if (data.isConditional) {
+      val trueState = data.value(condition = true)
+      val falseState = data.value(condition = false)
       TransferResult.conditional(
         trueValue =
           State(
-            data.value(condition = true).value.withMapping(node, Nullness.NONULL),
-            data.value(condition = true).store +
-              listOfNotNull(node.operand.resolveTrackedVariable()?.let { it to Nullness.NONULL }),
+            trueState.value.withMapping(node, trueState.valueOrBottom(node.expression)),
+            trueState.store,
           ),
         falseValue =
           State(
-            data.value(condition = false).value.withMapping(node, Nullness.NONULL),
-            data.value(condition = false).store,
+            falseState.value.withMapping(node, falseState.valueOrBottom(node.expression)),
+            falseState.store,
           ),
         exceptionalValues = mapOf(throwableType to data.value()),
       )
     } else {
-      super.visitBinaryExpressionWithType(node, data)
+      val state = data.value()
+      state.toNormalResult(node, state.valueOrBottom(node.expression))
+    }
+
+  override fun visitBinaryExpressionWithType(
+    node: UBinaryExpressionWithType,
+    data: TransferInput<State<Nullness>>,
+  ): TransferResult<State<Nullness>> {
+    return when {
+      node.operationKind == UastBinaryExpressionWithTypeKind.InstanceCheck.INSTANCE ->
+        // `instanceof` can only be `true` for non-null values
+        TransferResult.conditional(
+          trueValue =
+            State(
+              data.value(condition = true).value.withMapping(node, Nullness.NONULL),
+              data.value(condition = true).store +
+                listOfNotNull(node.operand.resolveTrackedVariable()?.let { it to Nullness.NONULL }),
+            ),
+          falseValue =
+            State(
+              data.value(condition = false).value.withMapping(node, Nullness.NONULL),
+              data.value(condition = false).store,
+            ),
+          exceptionalValues = mapOf(throwableType to data.value()),
+        )
+      node.operationKind is UastBinaryExpressionWithTypeKind.TypeCast -> {
+        val state = data.value()
+        val value =
+          if (node.type is PsiPrimitiveType) {
+            Nullness.NONULL
+          } else {
+            val operandNullness = state.valueOrBottom(node.operand)
+            val castTypeNullness = nullnessFromAnnotation(node.type)
+            when {
+              castTypeNullness == Nullness.NULLABLE -> Nullness.NULLABLE
+              indicatesNonNull(node.type) -> Nullness.NONULL
+              operandNullness != Nullness.BOTTOM -> operandNullness
+              else -> castTypeNullness
+            }
+          }
+        state.toNormalResult(
+          node,
+          value,
+          dereference = runIf(node.type is PsiPrimitiveType) { node.operand },
+        )
+      }
+      else -> super.visitBinaryExpressionWithType(node, data)
     }
   }
 
