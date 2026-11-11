@@ -1334,12 +1334,18 @@ private open class Psi2kTranslator(
       }
     }
 
+    // Kotlin allows neither visibility modifiers nor `inner` on local classes, but PSI reports
+    // them as package-private and usually non-static. This deliberately excludes classes nested
+    // in a local class, which PsiUtil.isLocalClass also matches but which still need `inner`.
+    val isLocalClass = parent is PsiClass && parent.parent is PsiDeclarationStatement
+
     // Use modifier order from https://kotlinlang.org/docs/coding-conventions.html#modifiers-order
     if (
       parent !is PsiParameter &&
         parent !is PsiLocalVariable &&
         // Record components become primary constructor properties with the record's visibility
         parent !is PsiRecordComponent &&
+        !isLocalClass &&
         node.hasModifierProperty(PsiModifier.PACKAGE_LOCAL)
     ) {
       data.append(" internal ")
@@ -1360,7 +1366,13 @@ private open class Psi2kTranslator(
     }
     if (node.hasAnnotation(JAVA_LANG_OVERRIDE)) data.append(" override ")
     // Nested records are implicitly static
-    if (parent is PsiClass && parent.parent !is PsiFile && !node.isStatic && !isRecord) {
+    if (
+      parent is PsiClass &&
+        parent.parent !is PsiFile &&
+        !node.isStatic &&
+        !isRecord &&
+        !isLocalClass
+    ) {
       data.append(" inner ")
     }
 
