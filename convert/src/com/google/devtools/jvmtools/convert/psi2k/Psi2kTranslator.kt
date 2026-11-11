@@ -100,6 +100,7 @@ import com.intellij.psi.PsiParenthesizedExpression
 import com.intellij.psi.PsiPolyadicExpression
 import com.intellij.psi.PsiPrimitiveType
 import com.intellij.psi.PsiQualifiedExpression
+import com.intellij.psi.PsiRecordComponent
 import com.intellij.psi.PsiReferenceExpression
 import com.intellij.psi.PsiReferenceList
 import com.intellij.psi.PsiReferenceParameterList
@@ -127,6 +128,7 @@ import com.intellij.psi.PsiVariable
 import com.intellij.psi.PsiWhiteSpace
 import com.intellij.psi.PsiWildcardType
 import com.intellij.psi.PsiYieldStatement
+import com.intellij.psi.util.JavaPsiRecordUtil.isCompactConstructor
 import com.intellij.psi.util.TypeConversionUtil.calcTypeForBinaryExpression
 import com.intellij.psi.util.TypeConversionUtil.isIntegralNumberType
 import com.intellij.psi.util.TypeConversionUtil.isNumericType
@@ -649,6 +651,9 @@ private open class Psi2kTranslator(
         .replaceNotNull { child ->
           when (child.tokenOrNull()) {
             JavaKeywords.ENUM -> "enum class"
+            // record Foo(int x) {...} ==> @JvmRecord data class Foo(val x: Int) {...}; the
+            // annotation is added by visitModifierList so it precedes visibility modifiers.
+            JavaKeywords.RECORD -> if (node.isRecord) "data class" else null
             "@" -> "annotation "
             JavaKeywords.INTERFACE -> if (node.isAnnotationType) "class" else "interface"
             "{" -> if (node.isAnnotationType) "(" else "{"
@@ -1122,6 +1127,18 @@ private open class Psi2kTranslator(
       return
     }
 
+    if (isCompactConstructor(node)) {
+      // Foo { <body> } ==> init { <body> }: component parameters are implicit in both languages.
+      node.children().forEach { child ->
+        when (child) {
+          node.nameIdentifier -> child.replaceWith("init")
+          node.body -> doAccept(child)
+          else -> skipRecursive(child) // modifiers (visibility is the record's), empty lists
+        }
+      }
+      return
+    }
+
     companionIfStatic(node) {
       val insertFunBefore: PsiElement = // never null
         node.typeParameterList ?: node.nameIdentifier ?: node.parameterList
@@ -1279,7 +1296,10 @@ private open class Psi2kTranslator(
   override fun visitModifierList(node: PsiModifierList) {
     val start = data.length()
     val parent = node.parent
+    val isRecord = parent is PsiClass && parent.isRecord
 
+    // Records become @JvmRecord data classes, which keep Java's `foo()` accessor names
+    if (isRecord) data.append("@JvmRecord ")
     if (node.hasModifierProperty(PsiModifier.SYNCHRONIZED)) data.append("@Synchronized ")
     if (node.hasModifierProperty(PsiModifier.TRANSIENT)) data.append("@Transient ")
     if (node.hasModifierProperty(PsiModifier.VOLATILE)) data.append("@Volatile ")
@@ -1318,22 +1338,29 @@ private open class Psi2kTranslator(
     if (
       parent !is PsiParameter &&
         parent !is PsiLocalVariable &&
+        // Record components become primary constructor properties with the record's visibility
+        parent !is PsiRecordComponent &&
         node.hasModifierProperty(PsiModifier.PACKAGE_LOCAL)
     ) {
       data.append(" internal ")
     }
     if (
       parent !is PsiVariable &&
-        (if (parent is PsiClass) !parent.isEnum else !node.isPrivate && !node.isStatic) &&
+        (if (parent is PsiClass) {
+          !parent.isEnum && !parent.isRecord
+        } else {
+          !node.isPrivate && !node.isStatic
+        }) &&
         (parent as? PsiMethod)?.isConstructor != true &&
         !node.hasModifierProperty(PsiModifier.FINAL) &&
         !node.hasModifierProperty(PsiModifier.ABSTRACT) &&
-        (parent?.parent as? PsiClass)?.isFinal != true
+        (parent?.parent as? PsiClass)?.let { it.isFinal || it.isRecord } != true
     ) {
       data.append(" open ")
     }
     if (node.hasAnnotation(JAVA_LANG_OVERRIDE)) data.append(" override ")
-    if (parent is PsiClass && parent.parent !is PsiFile && !node.isStatic) {
+    // Nested records are implicitly static
+    if (parent is PsiClass && parent.parent !is PsiFile && !node.isStatic && !isRecord) {
       data.append(" inner ")
     }
 
@@ -1453,6 +1480,13 @@ private open class Psi2kTranslator(
     translateVariable(node, runIf(node.isVarArgs) { "vararg " })
 
     // TODO(b/347273856): handle parameters that aren't effectively final
+  }
+
+  override fun visitRecordComponent(node: PsiRecordComponent) {
+    // <type> x ==> val x: <type> (primary constructor property of the resulting data class)
+    seen(node)
+
+    translateVariable(node, if (node.isVarArgs) "vararg val " else "val ")
   }
 
   override fun visitParameterList(list: PsiParameterList) {
