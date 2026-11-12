@@ -27,6 +27,7 @@ import com.intellij.psi.PsiDisjunctionType
 import com.intellij.psi.PsiElement
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiIntersectionType
+import com.intellij.psi.PsiMethod
 import com.intellij.psi.PsiModifierListOwner
 import com.intellij.psi.PsiPrimitiveType
 import com.intellij.psi.PsiType
@@ -151,4 +152,13 @@ fun PsiElement.isInNullMarkedScope(): Boolean {
   }
   // TODO(b/308816245): check package and module @Null[Un]Marked
   return false
+}
+
+fun isNullAwareHelperMethod(callee: PsiMethod): Boolean {
+  if (callee.parameterList.parametersCount != 1) return false
+  val ownerFqn = callee.containingClass?.qualifiedName
+  return ((callee.name == "isNull" || callee.name == "nonNull") &&
+    ownerFqn == "java.util.Objects") ||
+    (callee.name == "ofNullable" && ownerFqn == "java.util.Optional") ||
+    (callee.name == "fromNullable" && ownerFqn == "com.google.common.base.Optional")
 }
