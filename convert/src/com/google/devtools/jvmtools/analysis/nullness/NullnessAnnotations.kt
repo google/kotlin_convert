@@ -58,7 +58,10 @@ fun indicatesNullable(owner: PsiAnnotationOwner?, useTypeAnnos: Boolean = true):
 fun PsiAnnotation.isNullableAnno(useTypeAnnos: Boolean = true) =
   (qualifiedName?.endsWith(".Nullable") == true ||
     qualifiedName?.endsWith(".NullableDecl") == true || // checkerframework
-    qualifiedName == "javax.annotation.CheckForNull") && // used in Guava
+    qualifiedName == "javax.annotation.CheckForNull" || // used in Guava
+    (qualifiedName == "javax.annotation.Nonnull" &&
+      (findAttributeValue("when")?.textMatches("javax.annotation.meta.When.MAYBE") == true ||
+        findAttributeValue("when")?.textMatches("javax.annotation.meta.When.UNKNOWN") == true))) &&
     // This treats annotations that are type and declarations "conservatively" as type annotations
     // but that should (?) be ok as long as we look for both. Note
     // com.intellij.codeInsight.AnnotationTargetUtil.isStrictlyTypeUseAnnotation doesn't work
@@ -68,13 +71,22 @@ fun PsiAnnotation.isNullableAnno(useTypeAnnos: Boolean = true) =
 fun indicatesNonNull(owner: PsiAnnotationOwner?, useTypeAnnos: Boolean = true): Boolean =
   owner?.applicableAnnotations?.any { it.isNonNullAnno(useTypeAnnos) } == true
 
-fun PsiAnnotation.isNonNullAnno(useTypeAnnos: Boolean = true) =
-  (qualifiedName?.endsWith(".NonNull") == true ||
-    qualifiedName?.endsWith(".NotNull") == true ||
-    qualifiedName?.endsWith(".NonNullDecl") == true || // checkerframework
-    (qualifiedName == "javax.annotation.Nonnull" &&
-      findAttributeValue("when")?.textMatches("javax.annotation.meta.When.ALWAYS") == true)) &&
-    (useTypeAnnos || !isTypeAnnotation(this))
+fun PsiAnnotation.isNonNullAnno(useTypeAnnos: Boolean = true): Boolean {
+  val qName = qualifiedName ?: return false
+  val isNonNull =
+    when {
+      qName == "javax.annotation.Nonnull" -> {
+        val whenVal = findAttributeValue("when")
+        whenVal == null || whenVal.textMatches("javax.annotation.meta.When.ALWAYS")
+      }
+      qName.endsWith(".NonNull") ||
+        qName.endsWith(".NotNull") ||
+        qName.endsWith(".NonNullDecl") ||
+        (qName.endsWith(".Nonnull") && qName != "javax.annotation.Nonnull") -> true
+      else -> false
+    }
+  return isNonNull && (useTypeAnnos || !isTypeAnnotation(this))
+}
 
 internal fun nullnessFromAnnotation(
   type: PsiType?,
