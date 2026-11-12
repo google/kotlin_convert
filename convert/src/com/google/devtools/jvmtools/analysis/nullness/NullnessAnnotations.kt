@@ -18,22 +18,40 @@ package com.google.devtools.jvmtools.analysis.nullness
 
 import com.intellij.codeInsight.AnnotationTargetUtil.isTypeAnnotation
 import com.intellij.lang.java.JavaLanguage
+import com.intellij.psi.JavaRecursiveElementWalkingVisitor
 import com.intellij.psi.PsiAnnotation
 import com.intellij.psi.PsiAnnotationOwner
+import com.intellij.psi.PsiArrayType
+import com.intellij.psi.PsiAssignmentExpression
 import com.intellij.psi.PsiCapturedWildcardType
 import com.intellij.psi.PsiClass
 import com.intellij.psi.PsiClassType
+import com.intellij.psi.PsiConditionalExpression
 import com.intellij.psi.PsiDisjunctionType
 import com.intellij.psi.PsiElement
+import com.intellij.psi.PsiEnumConstant
+import com.intellij.psi.PsiExpression
+import com.intellij.psi.PsiField
 import com.intellij.psi.PsiFile
 import com.intellij.psi.PsiIntersectionType
+import com.intellij.psi.PsiLambdaExpression
+import com.intellij.psi.PsiLocalVariable
+import com.intellij.psi.PsiMethod
+import com.intellij.psi.PsiMethodCallExpression
+import com.intellij.psi.PsiModifier
 import com.intellij.psi.PsiModifierListOwner
+import com.intellij.psi.PsiParenthesizedExpression
 import com.intellij.psi.PsiPrimitiveType
+import com.intellij.psi.PsiReferenceExpression
+import com.intellij.psi.PsiReturnStatement
+import com.intellij.psi.PsiSubstitutor
 import com.intellij.psi.PsiType
 import com.intellij.psi.PsiTypeParameter
 import com.intellij.psi.PsiTypeVisitor
 import com.intellij.psi.PsiTypes
+import com.intellij.psi.PsiVariable
 import com.intellij.psi.PsiWildcardType
+import com.intellij.psi.util.InheritanceUtil
 import com.intellij.psi.util.TypeConversionUtil
 import com.intellij.psi.util.parentOfType
 
@@ -43,10 +61,12 @@ fun hasNullableAnno(owner: PsiModifierListOwner?): Boolean =
   indicatesNullable(owner?.modifierList, useTypeAnnos = owner?.isJava() != true)
 
 /** Returns if the receiver is defined in Java. */
-private fun PsiModifierListOwner.isJava() =
+fun PsiModifierListOwner.isJavaDeclaration() =
   language == JavaLanguage.INSTANCE &&
     // Language is always Java if defined in binary, so additionally check for Kotlin metadata
     parentOfType<PsiClass>(withSelf = true)?.hasAnnotation("kotlin.Metadata") != true
+
+private fun PsiModifierListOwner.isJava() = isJavaDeclaration()
 
 fun indicatesNullable(owner: PsiAnnotationOwner?, useTypeAnnos: Boolean = true): Boolean =
   // applicableAnnotations is sometimes available where .annotations throws. Note it doesn't work
@@ -152,3 +172,166 @@ fun PsiElement.isInNullMarkedScope(): Boolean {
   // TODO(b/308816245): check package and module @Null[Un]Marked
   return false
 }
+
+fun isNullAwareHelperMethod(callee: PsiMethod): Boolean {
+  if (callee.parameterList.parametersCount != 1) return false
+  val ownerFqn = callee.containingClass?.qualifiedName
+  return ((callee.name == "isNull" || callee.name == "nonNull") &&
+    ownerFqn == "java.util.Objects") ||
+    (callee.name == "ofNullable" && ownerFqn == "java.util.Optional") ||
+    (callee.name == "fromNullable" && ownerFqn == "com.google.common.base.Optional")
+}
+
+fun isExplicitlyNonNullReturn(method: PsiMethod): Boolean =
+  indicatesNonNull(method.modifierList, useTypeAnnos = method.returnType !is PsiArrayType) ||
+    indicatesNonNull(method.returnTypeElement) ||
+    indicatesNonNull(method.returnType)
+
+private fun isExplicitlyNonNullVariable(variable: PsiVariable): Boolean =
+  indicatesNonNull(variable.modifierList, useTypeAnnos = variable.type !is PsiArrayType) ||
+    indicatesNonNull(variable.typeElement) ||
+    indicatesNonNull(variable.type)
+
+/**
+ * Returns whether [method] lacks an explicit `@NonNull` return annotation, overrides at least one
+ * supertype method whose return contract is `@Nullable` (directly or via generic substitution), and
+ * does not override any supertype method that requires a non-null Kotlin return contract.
+ */
+fun overridesNullableReturn(method: PsiMethod): Boolean {
+  if (
+    method.isConstructor ||
+      method.hasModifierProperty(PsiModifier.STATIC) ||
+      method.returnType is PsiPrimitiveType ||
+      isExplicitlyNonNullReturn(method)
+  ) {
+    return false
+  }
+  val subClass = method.containingClass
+  val visited = HashSet<PsiMethod>()
+  val queue = ArrayDeque<PsiMethod>()
+  queue.addAll(method.findSuperMethods())
+  var foundNullableSuper = false
+  while (queue.isNotEmpty()) {
+    val superMethod = queue.removeFirst()
+    if (!visited.add(superMethod)) continue
+    val substitutedReturn = substitutedSuperReturnType(superMethod, subClass)
+    val superIsNullable =
+      hasNullableAnno(superMethod) ||
+        indicatesNullable(superMethod.returnTypeElement) ||
+        indicatesNullable(superMethod.returnType) ||
+        indicatesNullable(substitutedReturn)
+    // Use the return type as seen from the overriding class, so that a type parameter with a
+    // nullable bound (e.g., Kotlin `T`) instantiated with a non-null type argument counts as
+    // non-null.
+    val superRequiresNonNull =
+      isExplicitlyNonNullReturn(superMethod) ||
+        indicatesNonNull(substitutedReturn) ||
+        (!superIsNullable &&
+          (substitutedReturn ?: superMethod.returnType)?.hasNullableBound() != true &&
+          (!superMethod.isJava() ||
+            (superMethod.isInNullMarkedScope() && superMethod.body == null)))
+    if (superRequiresNonNull) {
+      return false
+    }
+    if (superIsNullable) {
+      foundNullableSuper = true
+    }
+    queue.addAll(superMethod.findSuperMethods())
+  }
+  return foundNullableSuper
+}
+
+/**
+ * Returns [superMethod]'s return type with the type arguments that [subClass] supplies for
+ * [superMethod]'s declaring class substituted, or `null` if that can't be determined.
+ */
+fun substitutedSuperReturnType(superMethod: PsiMethod, subClass: PsiClass?): PsiType? {
+  val superClass = superMethod.containingClass ?: return null
+  if (subClass == null || !InheritanceUtil.isInheritorOrSelf(subClass, superClass, true)) {
+    return null
+  }
+  return TypeConversionUtil.getSuperClassSubstitutor(superClass, subClass, PsiSubstitutor.EMPTY)
+    .substitute(superMethod.returnType)
+}
+
+/**
+ * Returns whether [method]'s body directly returns an unannotated Java platform call or field
+ * (whose nullability in Kotlin is a flexible platform type `T!`), possibly through local variables
+ * declared with `var`, whose Kotlin translation also has a flexible inferred type.
+ *
+ * Locals with explicit types and helper methods in the same file are not traced through, since
+ * their translated Kotlin declarations are non-null and would throw before the value is returned.
+ */
+fun methodReturnsFlexiblePlatformValue(method: PsiMethod): Boolean {
+  val body = method.body ?: return false
+  var foundFlexibleReturn = false
+  body.accept(
+    object : JavaRecursiveElementWalkingVisitor() {
+      override fun visitClass(aClass: PsiClass) {}
+
+      override fun visitLambdaExpression(expression: PsiLambdaExpression) {}
+
+      override fun visitReturnStatement(statement: PsiReturnStatement) {
+        if (foundFlexibleReturn) {
+          stopWalking()
+          return
+        }
+        if (exprHasFlexiblePlatformNullness(statement.returnValue, method, emptySet())) {
+          foundFlexibleReturn = true
+          stopWalking()
+          return
+        }
+        super.visitReturnStatement(statement)
+      }
+    }
+  )
+  return foundFlexibleReturn
+}
+
+private fun exprHasFlexiblePlatformNullness(
+  expr: PsiExpression?,
+  enclosingMethod: PsiMethod,
+  visitedVars: Set<PsiVariable>,
+): Boolean =
+  when (expr) {
+    null -> false
+    is PsiParenthesizedExpression ->
+      exprHasFlexiblePlatformNullness(expr.expression, enclosingMethod, visitedVars)
+    is PsiConditionalExpression ->
+      exprHasFlexiblePlatformNullness(expr.thenExpression, enclosingMethod, visitedVars) ||
+        exprHasFlexiblePlatformNullness(expr.elseExpression, enclosingMethod, visitedVars)
+    is PsiAssignmentExpression ->
+      expr.operationSign.text == "=" &&
+        exprHasFlexiblePlatformNullness(expr.rExpression, enclosingMethod, visitedVars)
+    is PsiMethodCallExpression -> {
+      val callee = expr.resolveMethod()
+      callee != null &&
+        !callee.isConstructor &&
+        callee.returnType !is PsiPrimitiveType &&
+        // Same-file methods get translated with explicit Kotlin return types
+        callee.containingFile != enclosingMethod.containingFile &&
+        callee.isJava() &&
+        !callee.isInNullMarkedScope() &&
+        !isExplicitlyNonNullReturn(callee)
+    }
+    is PsiReferenceExpression -> {
+      val ref = expr.resolve()
+      when {
+        ref is PsiField ->
+          ref.containingFile != enclosingMethod.containingFile &&
+            ref !is PsiEnumConstant &&
+            ref.type !is PsiPrimitiveType &&
+            ref.isJava() &&
+            !ref.isInNullMarkedScope() &&
+            !isExplicitlyNonNullVariable(ref)
+        // Only `var` locals keep a flexible type in Kotlin; other locals get explicit types.
+        ref is PsiLocalVariable &&
+          ref !in visitedVars &&
+          ref.typeElement.isInferredType &&
+          !isExplicitlyNonNullVariable(ref) ->
+          exprHasFlexiblePlatformNullness(ref.initializer, enclosingMethod, visitedVars + ref)
+        else -> false
+      }
+    }
+    else -> false
+  }
