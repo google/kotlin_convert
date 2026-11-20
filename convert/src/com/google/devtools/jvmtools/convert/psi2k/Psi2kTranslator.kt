@@ -128,6 +128,7 @@ import com.intellij.psi.PsiVariable
 import com.intellij.psi.PsiWhiteSpace
 import com.intellij.psi.PsiWildcardType
 import com.intellij.psi.PsiYieldStatement
+import com.intellij.psi.javadoc.PsiDocReferenceHolder
 import com.intellij.psi.util.JavaPsiRecordUtil.isCompactConstructor
 import com.intellij.psi.util.TypeConversionUtil.calcTypeForBinaryExpression
 import com.intellij.psi.util.TypeConversionUtil.isIntegralNumberType
@@ -263,6 +264,11 @@ private open class Psi2kTranslator(
       override fun visitComment(comment: PsiComment) {
         super.visitComment(comment)
         data.append(comment.text)
+      }
+
+      override fun visitDocReferenceHolder(refHolder: PsiDocReferenceHolder) {
+        // Do nothing: PsiDocReferenceHolderImpl.accept falls through to super.accept ->
+        // visitElement.
       }
 
       override fun visitWhiteSpace(space: PsiWhiteSpace) {
@@ -751,6 +757,12 @@ private open class Psi2kTranslator(
     // int foo, bar ==> foo: Int\nbar: Int
     seen(statement)
     statement.children().replaceNotNull { runIf(it.tokenOrNull() == ",") { "\n" } }
+  }
+
+  override fun visitDocReferenceHolder(refHolder: PsiDocReferenceHolder) {
+    // PsiDocReferenceHolderImpl.accept (IntelliJ 2026.1 / Android Lint 32.6.0+) calls
+    // visitDocReferenceHolder(this) and then unconditionally falls through to super.accept(visitor)
+    // -> visitElement(this). Ignore the first callback so each holder is visited only once.
   }
 
   override fun visitEnumConstant(node: PsiEnumConstant) {
