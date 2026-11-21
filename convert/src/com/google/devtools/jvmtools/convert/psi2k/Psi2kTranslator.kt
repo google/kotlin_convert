@@ -37,6 +37,7 @@ import com.intellij.lang.java.JavaLanguage
 import com.intellij.psi.JavaElementVisitor
 import com.intellij.psi.JavaRecursiveElementVisitor
 import com.intellij.psi.JavaRecursiveElementWalkingVisitor
+import com.intellij.psi.LambdaUtil
 import com.intellij.psi.PsiAnnotation
 import com.intellij.psi.PsiAnnotationMemberValue
 import com.intellij.psi.PsiAnnotationMethod
@@ -129,6 +130,7 @@ import com.intellij.psi.PsiWhiteSpace
 import com.intellij.psi.PsiWildcardType
 import com.intellij.psi.PsiYieldStatement
 import com.intellij.psi.util.JavaPsiRecordUtil.isCompactConstructor
+import com.intellij.psi.util.PsiUtil
 import com.intellij.psi.util.TypeConversionUtil.calcTypeForBinaryExpression
 import com.intellij.psi.util.TypeConversionUtil.isIntegralNumberType
 import com.intellij.psi.util.TypeConversionUtil.isNumericType
@@ -2128,7 +2130,8 @@ private open class Psi2kTranslator(
           ((node.parent as? PsiTypeElement)?.type as? PsiArrayType)?.deepComponentType
         ) ||
         inferredNullable(node.parent as? PsiVariable) ||
-        inferredNullableReturn(node.parent as? PsiMethod)
+        inferredNullableReturn(node.parent as? PsiMethod) ||
+        castAcceptsNullableResult(node, type)
     ) {
       data.append("?")
     } else if (
@@ -2141,6 +2144,138 @@ private open class Psi2kTranslator(
           ))
     ) {
       data.append(" & Any") // @NonNull T ==> T & Any (if T is a type variable)
+    }
+  }
+
+  private fun castAcceptsNullableResult(node: PsiTypeElement, type: PsiType): Boolean {
+    val castExpr = node.parent as? PsiTypeCastExpression ?: return false
+    if (castExpr.castType != node || type is PsiPrimitiveType || indicatesNonNull(node)) {
+      return false
+    }
+    val operand = castExpr.operand ?: return false
+    // NullnessAnalysis only analyzes methods and lambdas, so it has no results for operands in
+    // field initializers. Conservatively assume those may be null: we only relax casts whose target
+    // accepts null anyway, where `as T?` exactly matches Java's cast semantics.
+    // TODO(b/308816245): use analysis results for field initializers
+    val operandNullable =
+      operand.getParentOfTypes2<PsiMethod, PsiLambdaExpression>() == null ||
+        hasNullableValue(operand)
+    return operandNullable && castTargetAcceptsNull(castExpr)
+  }
+
+  private fun PsiExpression?.isNullLiteralPsi(): Boolean =
+    when (this) {
+      is PsiLiteralExpression -> type == PsiTypes.nullType()
+      is PsiParenthesizedExpression -> expression.isNullLiteralPsi()
+      else -> false
+    }
+
+  private fun lambdaTargetAcceptsNull(lambda: PsiLambdaExpression): Boolean {
+    val sam =
+      LambdaUtil.getFunctionalInterfaceMethod(lambda.functionalInterfaceType) ?: return false
+    val substitutedReturnType = LambdaUtil.getFunctionalInterfaceReturnType(lambda)
+    return hasNullableAnno(sam) ||
+      indicatesNullable(sam.returnTypeElement) ||
+      indicatesNullable(sam.returnType) ||
+      indicatesNullable(substitutedReturnType)
+  }
+
+  /**
+   * Returns if the receiver is a single-parameter JDK or Guava helper method that is meant to be
+   * called with possibly-`null` arguments, i.e., `java.util.Objects.isNull`,
+   * `java.util.Objects.nonNull`, `java.util.Optional.ofNullable`, or
+   * `com.google.common.base.Optional.fromNullable`.
+   */
+  private fun PsiMethod.isNullAwareHelperMethod(): Boolean {
+    if (parameterList.parametersCount != 1) return false
+    val ownerFqn = containingClass?.qualifiedName
+    return ((name == "isNull" || name == "nonNull") && ownerFqn == "java.util.Objects") ||
+      (name == "ofNullable" && ownerFqn == "java.util.Optional") ||
+      (name == "fromNullable" && ownerFqn == "com.google.common.base.Optional")
+  }
+
+  private fun castTargetAcceptsNull(expr: PsiExpression): Boolean {
+    var top: PsiExpression = expr
+    while (true) {
+      val parent = top.parent
+      top =
+        when {
+          parent is PsiParenthesizedExpression -> parent
+          parent is PsiTypeCastExpression &&
+            parent.castType?.type !is PsiPrimitiveType &&
+            !indicatesNonNull(parent.castType) -> parent
+          parent is PsiConditionalExpression &&
+            (parent.thenExpression == top || parent.elseExpression == top) -> parent
+          else -> break
+        }
+    }
+    return when (val consumer = top.parent) {
+      is PsiVariable ->
+        consumer.initializer == top &&
+          (hasNullableAnno(consumer) ||
+            indicatesNullable(consumer.typeElement) ||
+            indicatesNullable(consumer.type) ||
+            inferredNullable(consumer))
+      is PsiAssignmentExpression -> {
+        if (consumer.operationSign.text != "=" || consumer.rExpression != top) {
+          false
+        } else {
+          val target = (consumer.lExpression as? PsiReferenceExpression)?.resolve() as? PsiVariable
+          (target != null &&
+            (hasNullableAnno(target) ||
+              indicatesNullable(target.typeElement) ||
+              indicatesNullable(target.type) ||
+              inferredNullable(target))) || castTargetAcceptsNull(consumer)
+        }
+      }
+      is PsiReturnStatement -> {
+        val enclosing = top.getParentOfTypes2<PsiMethod, PsiLambdaExpression>()
+        consumer.returnValue == top &&
+          when (enclosing) {
+            is PsiMethod ->
+              hasNullableAnno(enclosing) ||
+                indicatesNullable(enclosing.returnTypeElement) ||
+                indicatesNullable(enclosing.returnType) ||
+                inferredNullableReturn(enclosing)
+            is PsiLambdaExpression -> lambdaTargetAcceptsNull(enclosing)
+            else -> false
+          }
+      }
+      is PsiLambdaExpression -> consumer.body == top && lambdaTargetAcceptsNull(consumer)
+      is PsiBinaryExpression -> {
+        val op = consumer.operationSign.text
+        if (op == "==" || op == "!=") {
+          val other = if (consumer.lOperand == top) consumer.rOperand else consumer.lOperand
+          other.isNullLiteralPsi()
+        } else {
+          false
+        }
+      }
+      is PsiExpressionList -> {
+        val call =
+          (consumer.parent as? PsiCall)
+            ?: ((consumer.parent as? PsiAnonymousClass)?.parent as? PsiCall)
+        val resolveResult = call?.resolveMethodGenerics()
+        val callee = resolveResult?.element as? PsiMethod
+        when {
+          callee == null -> false
+          callee.isNullAwareHelperMethod() -> true
+          else -> {
+            val argIndex = consumer.expressions.indexOf(top)
+            val params = callee.parameterList.parameters
+            val param = if (argIndex in params.indices) params[argIndex] else null
+            val substitutedParamType = param?.let { resolveResult.substitutor.substitute(it.type) }
+            param != null &&
+              !param.isVarArgs &&
+              (hasNullableAnno(param) ||
+                indicatesNullable(param.typeElement) ||
+                indicatesNullable(param.type) ||
+                indicatesNullable(substitutedParamType) ||
+                inferredNullable(param))
+          }
+        }
+      }
+      else -> false
     }
   }
 
@@ -2200,7 +2335,12 @@ private open class Psi2kTranslator(
   private fun hasNullableValue(expr: PsiExpression?): Boolean {
     // null PsiExpression can't evaluate to null, so return false for it.
     val (_, nullness) = expr?.nullness() ?: return false
-    return nullness.hasNullableValue(expr)
+    if (!nullness.hasNullableValue(expr)) return false
+    // The analysis models Java casts, which pass null through, but Kotlin's `as T` throws on null,
+    // so a reference cast's translation can only be null if we emit `as T?`.
+    val cast = PsiUtil.skipParenthesizedExprDown(expr) as? PsiTypeCastExpression ?: return true
+    val castType = cast.castType ?: return true
+    return indicatesNullable(castType) || castAcceptsNullableResult(castType, castType.type)
   }
 
   private fun inferredNullableReturn(method: PsiMethod?): Boolean {
